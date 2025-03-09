@@ -1,0 +1,86 @@
+default:
+  precision: 32
+  computation_device: "cuda"
+  logging_interval: 100
+  batch_size: 16
+  sequence_length: 4
+  debug: false
+  training_update_ratio: 1
+  number_of_pretraining_updates: 10      # Fewer pretraining updates for a quick test.
+  exploration_termination_step: 1000       # Shorter exploration phase.
+  number_of_possible_actions: 2
+  number_of_environments: 1
+  compile_models: true
+  use_state_mean_for_evaluation: true
+  log_video_predictions: false            # Disable video logging for faster runs.
+  use_orthogonal_initialization: false
+  optimizer_type: "adamw"
+  actor:
+    number_of_layers: 2
+    distribution_type: "gaussian"
+    lr: 1e-4
+    eps: 1e-4
+    grad_clip: 100
+    entropy: 0.01
+    standard_deviation: 1.0
+    minimum_standard_deviation: 0.1
+    maximum_standard_deviation: 2.0
+    temperature: 1.0
+    unimix_ratio: 0.0
+    output_scale: 1.0
+    exploration_behavior: "greedy"
+  critic:
+    number_of_layers: 2
+    distribution_type: "gaussian"
+    lr: 1e-4
+    eps: 1e-4
+    grad_clip: 100
+    use_slow_target: true
+    slow_target_update_interval: 100
+    slow_target_update_fraction: 0.005
+    output_scale: 1.0
+  dynamics_stochastic_dimension: 30
+  dynamics_deterministic_dimension: 200
+  dynamics_hidden_units: 200
+  dynamics_recurrent_depth: 1
+  dynamics_use_discrete: false
+  dynamics_mean_activation: "linear"
+  dynamics_standard_deviation_activation: "softplus"
+  dynamics_minimum_standard_deviation: 0.1
+  unimix_ratio: 0.0
+  initial_state_type: "zero"
+  encoder:
+    output_dimension: 1024
+  decoder:
+    dummy_parameter: null
+  reward_head:
+    distribution_type: "gaussian"
+    number_of_layers: 2
+    output_scale: 1.0
+    loss_scale: 1.0
+  continuation_head:
+    number_of_layers: 2
+    output_scale: 1.0
+    loss_scale: 1.0
+  units: 256
+  activation_function: "relu"
+  normalization_type: "layer"
+  model_learning_rate: 1e-4
+  optimizer_epsilon: 1e-4
+  gradient_clip_value: 100
+  weight_decay_value: 1e-4
+  discount_factor: 0.99
+  discount_lambda: 0.95
+  gradient_head_keys: ["decoder", "reward", "continuation"]
+  augmentation_enabled: true
+  exploration_behavior: "greedy"
+  random_seed: 42
+  action_repeat: 2
+  total_training_steps: 10000          # Quick test training.
+  evaluation_interval_steps: 1000        # Evaluate every 1000 steps.
+  evaluation_number_of_episodes: 2       # Fewer evaluation episodes for quick feedback.
+  training_episode_dir: ""
+  evaluation_episode_dir: ""
+  os_name: "posix"
+  reward_EMA: false
+  imag_horizon: 15

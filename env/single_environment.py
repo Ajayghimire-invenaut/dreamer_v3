@@ -24,21 +24,35 @@ class SingleEnvironment:
         self.action_space = self.environment.action_space
 
     def reset(self) -> Dict[str, Any]:
-        # Reset the environment; observation is ignored since we use the rendered image.
-        _, info = self.environment.reset(seed=None)
-        # Get the rendered image.
+        reset_result = self.environment.reset(seed=None)
+        # If gym.reset() returns a tuple (observation, info), use only observation.
+        if isinstance(reset_result, tuple):
+            observation = reset_result[0]
+        else:
+            observation = reset_result
         img = self.environment.render()
         processed_img = self._process_image(img)
-        return self._format_observation(processed_img, is_first=True)
+        return {"image": processed_img,
+                "is_first": np.array(True),
+                "is_terminal": np.array(False),
+                "discount": np.array(1.0)}
 
     def step(self, action: Any) -> Tuple[Dict[str, Any], float, bool, Dict]:
         cumulative_reward = 0.0
         done = False
         info = {}
+        # Loop over action repeats.
         for _ in range(self.action_repeat):
-            observation, reward, terminated, truncated, info = self.environment.step(action)
+            # Get the result from step.
+            result = self.environment.step(action)
+            if len(result) == 5:
+                observation, reward, terminated, truncated, info = result
+                done = terminated or truncated
+            elif len(result) == 4:
+                observation, reward, done, info = result
+            else:
+                raise ValueError("Unexpected number of values returned from environment.step")
             cumulative_reward += reward
-            done = terminated or truncated
             if done:
                 break
         # Use the rendered image as the observation.
@@ -46,10 +60,22 @@ class SingleEnvironment:
         processed_img = self._process_image(img)
         return self._format_observation(processed_img, is_first=False), cumulative_reward, done, info
 
-    def _process_image(self, img: np.ndarray) -> np.ndarray:
-        # Resize the image to 64x64.
-        resized = cv2.resize(img, (64, 64))
-        return resized.astype(np.uint8)
+    def _process_image(self, img: Any) -> np.ndarray:
+      try:
+          if img is None:
+              print("Warning: render() returned None. Creating a dummy image.")
+              img = np.zeros((64, 64, 3), dtype=np.uint8)
+          else:
+              img = np.array(img)
+          # Check if the image has at least 2 dimensions and non-zero size in the first two dimensions.
+          if img.ndim < 2 or img.shape[0] == 0 or img.shape[1] == 0:
+              print("Warning: render() returned an invalid image shape. Creating a dummy image.")
+              img = np.zeros((64, 64, 3), dtype=np.uint8)
+          resized = cv2.resize(img, (64, 64))
+          return resized.astype(np.uint8)
+      except Exception as e:
+          print("Error in _process_image:", e)
+          return np.zeros((64, 64, 3), dtype=np.uint8)
 
     def _format_observation(self, processed_img: np.ndarray, is_first: bool) -> Dict[str, Any]:
         return {

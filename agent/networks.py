@@ -23,11 +23,9 @@ class MultiEncoder(nn.Module):
                  output_dimension: int,
                  use_orthogonal: bool = False) -> None:
         super(MultiEncoder, self).__init__()
-        # If an "image" key exists and its shape has 3 dimensions, assume it's image data.
         if "image" in input_shapes and len(input_shapes["image"]) == 3:
             self.is_image = True
-            # Raw image shape is assumed to be (H, W, C); extract C.
-            in_channels = input_shapes["image"][2]  # e.g. (64,64,3) → 3 channels
+            in_channels = input_shapes["image"][2]  # (H, W, C) → C channels
             self.convolutional_layers = nn.Sequential(
                 nn.Conv2d(in_channels=in_channels, out_channels=32, kernel_size=4, stride=2),
                 nn.ReLU(),
@@ -38,7 +36,7 @@ class MultiEncoder(nn.Module):
                 nn.Conv2d(in_channels=128, out_channels=256, kernel_size=4, stride=2),
                 nn.ReLU()
             )
-            # Expected conv output: (256, 2, 2) → flattened size is 256*2*2 = 1024.
+            # Expected output shape: (256, 2, 2) → flattened = 256*2*2 = 1024.
             self.fc = nn.Linear(256 * 2 * 2, output_dimension)
             if use_orthogonal:
                 self.convolutional_layers.apply(orthogonal_initialize)
@@ -59,7 +57,6 @@ class MultiEncoder(nn.Module):
             image = observations["image"]
             if getattr(observations, "debug", False):
                 print("MultiEncoder received image with shape:", image.shape)
-            # If image is 5D: (B, T, H, W, C) then permute to (B, T, C, H, W)
             if image.dim() == 5:
                 if image.shape[-1] in [1, 3]:
                     image = image.permute(0, 1, 4, 2, 3)
@@ -68,22 +65,20 @@ class MultiEncoder(nn.Module):
                 B, T, C, H, W = image.shape
                 image = image.reshape(B * T, C, H, W)
                 features = self.convolutional_layers(image)
-                flattened = features.reshape(features.size(0), -1)
-                out = self.fc(flattened)  # (B*T, D)
+                flattened = features.view(features.size(0), -1)
+                out = self.fc(flattened)
                 out = out.view(B, T, -1)
                 if getattr(observations, "debug", False):
                     print("MultiEncoder output shape (batched sequence):", out.shape)
                 return out
-            # If a single image is provided (3D: H, W, C), permute to (C, H, W) and add batch dimension.
             elif image.dim() == 3:
                 if image.shape[-1] in [1, 3]:
                     image = image.permute(2, 0, 1)
                 image = image.unsqueeze(0)
-            # If batched images are provided in HWC order, permute to CHW.
             elif image.dim() == 4 and image.shape[-1] in [1, 3]:
                 image = image.permute(0, 3, 1, 2)
             features = self.convolutional_layers(image)
-            flattened = features.reshape(features.size(0), -1)
+            flattened = features.view(features.size(0), -1)
             out = self.fc(flattened)
             if getattr(observations, "debug", False):
                 print("MultiEncoder output shape (batched):", out.shape)
@@ -108,24 +103,34 @@ class RSSM(nn.Module):
                  number_of_actions: int,
                  embedding_dimension: int,
                  device: str,
-                 use_orthogonal: bool = False) -> None:
+                 use_orthogonal: bool = False,
+                 discrete_latent_num: int = 32,
+                 discrete_latent_size: int = 32) -> None:
         super(RSSM, self).__init__()
-        self.stoch_dimension = stoch_dimension
-        self.deter_dimension = deter_dimension
-        self.hidden_units = hidden_units
-        self.rec_depth = rec_depth
         self.use_discrete = use_discrete
         self.device = device
         self.number_of_actions = number_of_actions
+        self.deter_dimension = deter_dimension
+        self.hidden_units = hidden_units
+        self.rec_depth = rec_depth
         self.gru = nn.GRU(input_size=embedding_dimension + number_of_actions,
                           hidden_size=deter_dimension, batch_first=True)
-        self.mean_layer = nn.Linear(deter_dimension, stoch_dimension)
-        self.std_layer = nn.Linear(deter_dimension, stoch_dimension)
-        self.minimum_std = min_std
+        if use_discrete:
+            self.discrete_latent_num = discrete_latent_num
+            self.discrete_latent_size = discrete_latent_size
+            # Output logits for discrete latent variables.
+            self.logits_layer = nn.Linear(deter_dimension, discrete_latent_num * discrete_latent_size)
+        else:
+            self.mean_layer = nn.Linear(deter_dimension, stoch_dimension)
+            self.std_layer = nn.Linear(deter_dimension, stoch_dimension)
+            self.minimum_std = min_std
         if use_orthogonal:
             self.gru.apply(orthogonal_initialize)
-            orthogonal_initialize(self.mean_layer)
-            orthogonal_initialize(self.std_layer)
+            if self.use_discrete:
+                orthogonal_initialize(self.logits_layer)
+            else:
+                orthogonal_initialize(self.mean_layer)
+                orthogonal_initialize(self.std_layer)
 
     def observe(self,
                 embeddings: torch.Tensor,
@@ -133,11 +138,18 @@ class RSSM(nn.Module):
                 is_first: torch.Tensor) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         combined = torch.cat([embeddings, actions], dim=-1)
         outputs, _ = self.gru(combined)
-        deter = outputs
-        mean = self.mean_layer(outputs)
-        std = F.softplus(self.std_layer(outputs)) + self.minimum_std
-        posterior = {"deter": deter, "mean": mean, "std": std}
-        prior = posterior
+        deter = outputs  # [T, B, deter_dimension]
+        if self.use_discrete:
+            logits = self.logits_layer(outputs)
+            T, B, _ = logits.shape
+            logits = logits.view(T, B, self.discrete_latent_num, self.discrete_latent_size)
+            posterior = {"deter": deter, "logits": logits}
+            prior = posterior  # In a full implementation, prior is computed separately.
+        else:
+            mean = self.mean_layer(outputs)
+            std = F.softplus(self.std_layer(outputs)) + self.minimum_std
+            posterior = {"deter": deter, "mean": mean, "std": std}
+            prior = posterior
         return posterior, prior
 
     def observe_step(self,
@@ -154,17 +166,26 @@ class RSSM(nn.Module):
         elif previous_action.dim() < 2:
             previous_action = previous_action.unsqueeze(0)
             previous_action = torch.nn.functional.one_hot(previous_action.long(), num_classes=self.number_of_actions).float()
-
         combined = torch.cat([embedding, previous_action], dim=-1).unsqueeze(1)
         output, _ = self.gru(combined)
         deter = output.squeeze(1)
-        mean = self.mean_layer(deter)
-        std = F.softplus(self.std_layer(deter)) + self.minimum_std
-        new_state = {"deter": deter, "mean": mean, "std": std}
+        if self.use_discrete:
+            logits = self.logits_layer(deter)
+            B = logits.shape[0]
+            logits = logits.view(B, self.discrete_latent_num, self.discrete_latent_size)
+            new_state = {"deter": deter, "logits": logits}
+        else:
+            mean = self.mean_layer(deter)
+            std = F.softplus(self.std_layer(deter)) + self.minimum_std
+            new_state = {"deter": deter, "mean": mean, "std": std}
         return new_state, None
 
     def get_features(self, state: Dict[str, torch.Tensor]) -> torch.Tensor:
-        # If "deter" is missing, warn and fallback to "mean" only.
+        if self.use_discrete:
+            # Convert logits to probabilities and flatten.
+            probs = torch.softmax(state["logits"], dim=-1)
+            probs_flat = probs.view(probs.shape[0], -1)
+            return torch.cat([state["deter"], probs_flat], dim=-1)
         if "deter" not in state:
             print("Warning: 'deter' not in state. Keys present:", state.keys())
             return state["mean"]
@@ -174,11 +195,9 @@ class RSSM(nn.Module):
                             actions: torch.Tensor,
                             initial_state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         horizon = actions.shape[1]
-        repeated_state = {
-            "mean": initial_state["mean"].unsqueeze(1).repeat(1, horizon, 1),
-            "std": initial_state["std"].unsqueeze(1).repeat(1, horizon, 1),
-            "deter": initial_state["deter"].unsqueeze(1).repeat(1, horizon, 1)
-        }
+        repeated_state = {}
+        for key in initial_state:
+            repeated_state[key] = initial_state[key].unsqueeze(1).repeat(1, horizon, 1)
         return repeated_state
 
     def compute_kl_loss(self,
@@ -187,9 +206,21 @@ class RSSM(nn.Module):
                         kl_free: float,
                         dynamics_scale: float,
                         representation_scale: float) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        kl = torch.abs(posterior["mean"] - prior["mean"])
-        kl_loss = torch.clamp(kl.mean(), min=kl_free)
-        return kl_loss, kl.mean(), kl_loss, kl_loss
+        if self.use_discrete:
+            post_logits = posterior["logits"]
+            prior_logits = prior["logits"]
+            post = torch.softmax(post_logits, dim=-1)
+            prior = torch.softmax(prior_logits, dim=-1)
+            # Compute categorical KL divergence.
+            kl = post * (torch.log(post + 1e-8) - torch.log(prior + 1e-8))
+            kl = kl.sum(dim=-1).mean()
+        else:
+            mean_diff = posterior["mean"] - prior["mean"]
+            var_ratio = (posterior["std"] / prior["std"])**2
+            kl = 0.5 * (var_ratio + (mean_diff**2) / (prior["std"]**2) - 1 - torch.log(var_ratio + 1e-8))
+            kl = kl.mean()
+        kl_loss = torch.clamp(kl, min=kl_free)
+        return kl_loss, kl, dynamics_scale, representation_scale
 
 class MultiDecoder(nn.Module):
     def __init__(self,
@@ -198,7 +229,6 @@ class MultiDecoder(nn.Module):
                  dummy_parameter: Any,
                  use_orthogonal: bool = False) -> None:
         super(MultiDecoder, self).__init__()
-        # Get output shape from observation space (assumed HWC); convert to CHW.
         raw_output_shape = output_shapes["image"]
         if len(raw_output_shape) == 3 and raw_output_shape[-1] <= 4:
             self.output_shape = (raw_output_shape[-1], raw_output_shape[0], raw_output_shape[1])
@@ -207,9 +237,7 @@ class MultiDecoder(nn.Module):
         if getattr(self, "debug", False):
             print("MultiDecoder output_shape set to:", self.output_shape)
         if len(self.output_shape) == 3:
-            # Convolutional branch for image output.
             self.decoder_type = "conv"
-            # Generate a 4x4 feature map.
             self.fc = nn.Linear(feature_dimension, 256 * 4 * 4)
             self.deconv_layers = nn.Sequential(
                 nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),
@@ -223,9 +251,8 @@ class MultiDecoder(nn.Module):
             if use_orthogonal:
                 orthogonal_initialize(self.fc)
                 self.deconv_layers.apply(orthogonal_initialize)
-            self.debug = False  # Set to True to enable debug prints.
+            self.debug = False
         else:
-            # MLP branch for vector (or low-dimensional) output.
             self.decoder_type = "mlp"
             output_dim = 1
             for dim in self.output_shape:
@@ -307,33 +334,56 @@ class MLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> Any:
         output = self.network(x)
-        return DistributionWrapper(output)
+        return DistributionWrapper(output, dist_type=self.distribution_type)
 
-# Updated DistributionWrapper with an entropy method
 class DistributionWrapper:
-    def __init__(self, logits: torch.Tensor) -> None:
+    def __init__(self, logits: torch.Tensor, dist_type: str = "gaussian") -> None:
         self.logits = logits
+        self.dist_type = dist_type
 
     def log_prob(self, target: torch.Tensor) -> torch.Tensor:
-        # If target has one less dimension than logits, unsqueeze it.
-        if target.dim() == self.logits.dim() - 1:
-            target = target.unsqueeze(-1)
-        # If batch dimensions do not match, try transposing.
-        if self.logits.shape[0] != target.shape[0]:
-            target = target.transpose(0, 1)
-        return -((self.logits - target) ** 2).mean()
+        if self.dist_type == "gaussian":
+            if target.dim() == self.logits.dim() - 1:
+                target = target.unsqueeze(-1)
+            if self.logits.shape[0] != target.shape[0]:
+                target = target.transpose(0, 1)
+            return -((self.logits - target) ** 2).mean()
+        elif self.dist_type == "symlog_disc":
+            # Discretize target (for example by rounding) to obtain integer bins.
+            # In a full implementation, two-hot encoding is used.
+            target = target.long().squeeze(-1)
+            logits = self.logits.view(-1, self.logits.shape[-1])
+            return -nn.functional.cross_entropy(logits, target.view(-1), reduction='mean')
+        else:
+            raise ValueError("Unsupported distribution type")
 
     def mode(self) -> torch.Tensor:
-        return self.logits
+        if self.dist_type == "gaussian":
+            return self.logits
+        elif self.dist_type == "symlog_disc":
+            mode = torch.argmax(self.logits, dim=-1)
+            return mode.float()
+        else:
+            raise ValueError("Unsupported distribution type")
 
     def sample(self) -> torch.Tensor:
-        noise = torch.randn_like(self.logits) * 0.1
-        return self.logits + noise
+        if self.dist_type == "gaussian":
+            noise = torch.randn_like(self.logits) * 0.1
+            return self.logits + noise
+        elif self.dist_type == "symlog_disc":
+            probs = torch.softmax(self.logits, dim=-1)
+            distribution = torch.distributions.Categorical(probs=probs)
+            return distribution.sample().float()
+        else:
+            raise ValueError("Unsupported distribution type")
 
     def entropy(self) -> torch.Tensor:
-        # Assume a fixed standard deviation sigma for a Gaussian distribution.
-        sigma = 0.1
-        # Entropy for a Gaussian: 0.5 * log(2 * pi * e * sigma^2)
-        entropy_value = 0.5 * math.log(2 * math.pi * math.e * (sigma ** 2))
-        # Return a tensor with the same shape as logits filled with the entropy value.
-        return torch.full_like(self.logits, entropy_value)
+        if self.dist_type == "gaussian":
+            sigma = 0.1
+            entropy_value = 0.5 * math.log(2 * math.pi * math.e * (sigma ** 2))
+            return torch.full_like(self.logits, entropy_value)
+        elif self.dist_type == "symlog_disc":
+            probs = torch.softmax(self.logits, dim=-1)
+            return torch.distributions.Categorical(probs=probs).entropy()
+        else:
+            raise ValueError("Unsupported distribution type")

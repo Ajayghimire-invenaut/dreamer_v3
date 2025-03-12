@@ -89,7 +89,7 @@ def static_scan_imagine(start_state: Any, horizon: int, dynamics_model: Any, act
       imagined_state: Dict with "mean", "std", and "deter" each of shape [horizon, batch, dimension].
       imagined_actions: Dummy tensor of shape [horizon, batch, action_dim].
     """
-    batch_size = 32  # Should be consistent with your training batch size.
+    batch_size = 32  # Make sure this matches your training batch size.
     total_dimension = dynamics_model.stoch_dimension + dynamics_model.deter_dimension
     imagined_features = torch.zeros(horizon, batch_size, total_dimension, device=dynamics_model.device)
     imagined_state = {
@@ -101,20 +101,27 @@ def static_scan_imagine(start_state: Any, horizon: int, dynamics_model: Any, act
     return imagined_features, imagined_state, imagined_actions
 
 # Loss and Target Computations
-def lambda_return_target(reward: torch.Tensor, value: torch.Tensor, discount: float, lambda_value: float, free_nats: float = 3.0) -> Tuple[List[torch.Tensor], torch.Tensor, torch.Tensor]:
+def lambda_return_target(reward: torch.Tensor,
+                         value: torch.Tensor,
+                         discount: float,
+                         lambda_value: float,
+                         normalize: bool = True) -> Tuple[List[torch.Tensor], torch.Tensor, torch.Tensor]:
     """
-    Compute lambda-return targets with free nats.
+    Compute lambda-return targets and optionally normalize them.
+    
+    Instead of clamping the return using free nats, this implementation computes the recursive return and then
+    normalizes it by subtracting the mean and dividing by max(std, 1.0).
     
     Args:
-      reward: Tensor [T, B, 1].
-      value: Tensor [T, B, 1].
-      discount: Discount factor.
-      lambda_value: Lambda parameter.
-      free_nats: Free nats threshold.
-    
+      reward: Tensor of shape [T, B, 1].
+      value: Tensor of shape [T, B, 1].
+      discount: Discount factor (e.g. 0.997).
+      lambda_value: Lambda parameter (e.g. 0.95).
+      normalize: Whether to normalize the returns.
+      
     Returns:
       target: List of T tensors.
-      weights: Tensor [T, B] (ones).
+      weights: Tensor of shape [T, B] (all ones).
       baseline: The original value tensor.
     """
     T, B, _ = reward.shape
@@ -122,7 +129,14 @@ def lambda_return_target(reward: torch.Tensor, value: torch.Tensor, discount: fl
     next_return = value[-1]
     for t in reversed(range(T)):
         next_return = reward[t] + discount * ((1 - lambda_value) * value[t] + lambda_value * next_return)
-        returns[t] = torch.clamp(next_return, min=free_nats)
+        returns[t] = next_return
+    returns_tensor = torch.stack(returns, dim=0)  # Shape [T, B, 1]
+    if normalize:
+        mean = returns_tensor.mean()
+        std = returns_tensor.std()
+        divisor = std if std > 1.0 else 1.0
+        returns_tensor = (returns_tensor - mean) / divisor
+        returns = [returns_tensor[t] for t in range(T)]
     weights = torch.ones(T, B, device=value.device)
     return returns, weights, value
 
@@ -151,11 +165,10 @@ def compute_actor_loss(actor: Any,
       actor_loss: Scalar tensor.
       metrics: Dict with metrics.
     """
-    target_stack = torch.stack(target, dim=0)
+    target_stack = torch.stack(target, dim=0)  # Shape [T, B, 1]
     advantage = target_stack - baseline
     dist = actor(features)
     log_prob = dist.log_prob(actions)
-    # Now entropy() is available on our DistributionWrapper.
     entropy = dist.entropy().mean()
     actor_loss = -(log_prob * advantage.detach() * weights.unsqueeze(-1)).mean()
     actor_loss -= configuration.actor["entropy"] * entropy
@@ -184,8 +197,8 @@ def augment_image(image: torch.Tensor, crop_size: int) -> torch.Tensor:
     cropped = image[:, top:top+crop_size, left:left+crop_size, :]
     if torch.rand(1).item() < 0.5:
         cropped = torch.flip(cropped, dims=[2])
-    brightness = 0.8 + 0.4 * torch.rand(1).item()  # [0.8, 1.2]
-    contrast = 0.8 + 0.4 * torch.rand(1).item()    # [0.8, 1.2]
+    brightness = 0.8 + 0.4 * torch.rand(1).item()
+    contrast = 0.8 + 0.4 * torch.rand(1).item()
     mean = cropped.mean(dim=(1,2), keepdim=True)
     cropped = (cropped - mean) * contrast + mean * brightness
     return torch.clamp(cropped, 0.0, 1.0)
@@ -210,7 +223,6 @@ class DistributionWrapper:
     def __init__(self, logits: torch.Tensor) -> None:
         self.logits = logits
     def log_prob(self, target: torch.Tensor) -> torch.Tensor:
-        # Assume a simple squared error loss formulation.
         if target.dim() == self.logits.dim() - 1:
             target = target.unsqueeze(-1)
         return -((self.logits - target) ** 2).mean()
@@ -220,11 +232,8 @@ class DistributionWrapper:
         noise = torch.randn_like(self.logits) * 0.1
         return self.logits + noise
     def entropy(self) -> torch.Tensor:
-        # Assume a Gaussian with a fixed standard deviation, e.g., 0.1.
-        std = 0.1
-        # For a Gaussian, entropy = 0.5 * log(2πe * std²)
-        entropy_value = 0.5 * torch.log(torch.tensor(2 * torch.pi * torch.e * (std ** 2)))
-        # Return a tensor of the same shape as logits.
+        sigma = 0.1
+        entropy_value = 0.5 * torch.log(torch.tensor(2 * torch.pi * torch.e * (sigma ** 2)))
         return torch.full_like(self.logits, entropy_value)
 
 # RewardEMA for reward normalization

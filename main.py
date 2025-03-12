@@ -5,15 +5,20 @@ runs a data collection (prefill) phase if needed, prints intermediate debug metr
 and at the end plots the loss history.
 """
 
+import os
 import argparse
 import pathlib
-import os
 import torch
 import time
 from typing import Any
 import matplotlib.pyplot as plt
 import ruamel.yaml
 from ruamel.yaml import YAML
+import numpy as np
+
+# Use os.getuid() if available; otherwise, use a fallback value.
+uid = os.getuid() if hasattr(os, "getuid") else "win"
+os.environ["XDG_RUNTIME_DIR"] = f"/tmp/runtime-{uid}"
 
 from agent.dreamer_agent import DreamerAgent
 from env.single_environment import SingleEnvironment
@@ -42,14 +47,18 @@ def evaluate_agent(agent: DreamerAgent, env: SingleEnvironment, num_episodes: in
     """
     Run evaluation episodes using a deterministic policy (using the actor's mode).
     Logs cumulative reward for each episode and returns the average reward.
+    Also logs simple image statistics (mean and std) to verify diversity.
     """
     total_reward = 0.0
     for ep in range(num_episodes):
         obs = env.reset()
+        # Log observation statistics to ensure images are diverse.
+        img = obs["image"]
+        print(f"DEBUG: Evaluation observation mean: {np.mean(img):.2f}, std: {np.std(img):.2f}", flush=True)
         done = False
         ep_reward = 0.0
         while not done:
-            # Use a deterministic policy by setting training=False (agent returns mode instead of sampling).
+            # Use a deterministic policy (mode of the actor distribution).
             policy_output, _ = agent.forward(obs, reset_flags=[True], training=False)
             action = policy_output["action"]
             obs, reward, done, _ = env.step(action)
@@ -80,6 +89,7 @@ def main(args: Any) -> None:
     logger_obj = Logger(log_directory=log_directory, global_step=args.action_repeat * initial_steps)
     print("Logging to:", log_directory, flush=True)
 
+    # Create the environment.
     environment_instance = SingleEnvironment(task_name=args.task_name, action_repeat=args.action_repeat, seed=args.random_seed)
     if args.use_parallel_environments:
         environment_instance = Parallel(environment_instance, strategy="process")
@@ -94,6 +104,7 @@ def main(args: Any) -> None:
     training_dataset = create_dataset(training_episodes, args)
     evaluation_dataset = create_dataset(evaluation_episodes, args)
 
+    # Instantiate the agent.
     agent = DreamerAgent(environment_instance.observation_space,
                            environment_instance.action_space,
                            args, logger_obj, training_dataset)
@@ -115,7 +126,7 @@ def main(args: Any) -> None:
         metrics = logger_obj.write(fps=True)
         print(f"[Iteration {iteration}] Metrics: {metrics}", flush=True)
         
-        # Record loss metrics (adjust keys based on your modules).
+        # Record loss metrics.
         actor_loss = metrics.get("actor_loss", 0.0)
         kl_loss = metrics.get("kl_loss", 0.0)
         reconstruction_loss = metrics.get("reconstruction_loss", 0.0)
@@ -124,6 +135,17 @@ def main(args: Any) -> None:
         kl_loss_history.append(kl_loss)
         reconstruction_loss_history.append(reconstruction_loss)
         exploration_loss_history.append(exploration_loss)
+        
+        # Convert GPU tensors to CPU before taking the mean and logging.
+        for metric_name, metric_values in metrics.items():
+            try:
+                if isinstance(metric_values, torch.Tensor):
+                    value = float(np.mean(metric_values.cpu().numpy()))
+                else:
+                    value = float(np.mean(metric_values))
+                logger_obj.scalar(metric_name, value)
+            except Exception as e:
+                print(f"Error logging {metric_name}: {e}")
         
         print(f"[Iteration {iteration}] Actor Loss: {actor_loss:.4f}, KL Loss: {kl_loss:.4f}, "
               f"Reconstruction Loss: {reconstruction_loss:.4f}, Exploration Loss: {exploration_loss:.4f}", flush=True)

@@ -31,7 +31,8 @@ class Optimizer:
             self.optimizer = torch.optim.SGD(parameters, lr=learning_rate)
         else:
             raise ValueError(f"Unknown optimizer type: {opt}")
-        self.scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+        # Updated AMP API: use torch.amp.GradScaler with explicit device string.
+        self.scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
         self.scheduler = CosineAnnealingLR(self.optimizer, T_max=total_steps) if total_steps is not None else None
 
     def __call__(self, loss: torch.Tensor, parameters_to_clip: Any, retain_graph: bool = True) -> Dict[str, float]:

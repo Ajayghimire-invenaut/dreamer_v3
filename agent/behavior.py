@@ -18,14 +18,11 @@ class ImaginedBehavior(nn.Module):
         self.configuration = configuration
         self.world_model = world_model
 
-        # Compute feature_dimension based on dynamics configuration.
-        # For continuous dynamics: feature_dim = stochastic_dim + deterministic_dim (e.g., 30+200 = 230)
         if configuration.dynamics_use_discrete:
-            feature_dimension = configuration.dynamics_stochastic_dimension * configuration.dynamics_use_discrete + configuration.dynamics_deterministic_dimension
+            feature_dimension = configuration.discrete_latent_num * configuration.discrete_latent_size + configuration.dynamics_deterministic_dimension
         else:
             feature_dimension = configuration.dynamics_stochastic_dimension + configuration.dynamics_deterministic_dimension
 
-        # Define the actor network.
         self.actor = MLP(
             input_dim=feature_dimension,
             output_shape=(configuration.number_of_possible_actions,),
@@ -45,7 +42,6 @@ class ImaginedBehavior(nn.Module):
             name="Actor",
             use_orthogonal=configuration.use_orthogonal_initialization
         )
-        # Define the value (critic) network.
         self.value = MLP(
             input_dim=feature_dimension,
             output_shape=(255,) if configuration.critic["distribution_type"] == "symlog_disc" else (),
@@ -63,7 +59,6 @@ class ImaginedBehavior(nn.Module):
             self.slow_value = self.value
             self.update_counter = 0
 
-        # Set up optimizers for actor and critic.
         optimizer_args = dict(weight_decay=configuration.weight_decay_value,
                               opt=configuration.optimizer_type,
                               use_amp=self.use_amp)
@@ -85,20 +80,18 @@ class ImaginedBehavior(nn.Module):
     def train_step(self, starting_state: Any, objective_function: Any) -> Tuple[torch.Tensor, Any, torch.Tensor, torch.Tensor, Dict[str, float]]:
         self._update_slow_target()
         metrics: Dict[str, float] = {}
-        with torch.cuda.amp.autocast(self.use_amp):
-            # Generate imagined trajectories using the dynamics model.
+        with torch.amp.autocast("cuda", enabled=self.use_amp):
             imagined_features, imagined_state, imagined_actions = static_scan_imagine(
                 starting_state, 
                 self.configuration.imag_horizon, 
                 self.world_model.dynamics,
-                self.configuration.number_of_possible_actions  # Action dimension, e.g. 2.
+                self.configuration.number_of_possible_actions
             )
             if getattr(self.configuration, "debug", False):
                 print("[DEBUG] Imagined features shape:", imagined_features.shape)
             intrinsic_reward = objective_function(imagined_features, imagined_state, imagined_actions)
             if getattr(self.configuration, "debug", False):
                 print("[DEBUG] Intrinsic reward shape:", intrinsic_reward.shape)
-            # Ensure the imagined_state contains "deter"
             if "deter" not in imagined_state:
                 if getattr(self.configuration, "debug", False):
                     print("[DEBUG] 'deter' not found in imagined_state; creating dummy tensor.")
@@ -109,7 +102,6 @@ class ImaginedBehavior(nn.Module):
                 im_state["deter"] = torch.zeros(horizon, B, self.configuration.dynamics_deterministic_dimension, device=device)
             else:
                 im_state = imagined_state
-            # Compute full imagined features by concatenating "deter" and "mean".
             full_imagined_features = self.world_model.dynamics.get_features(im_state)
             if getattr(self.configuration, "debug", False):
                 print("[DEBUG] Full imagined features shape:", full_imagined_features.shape)
@@ -119,7 +111,6 @@ class ImaginedBehavior(nn.Module):
             )
             if getattr(self.configuration, "debug", False):
                 print("[DEBUG] Lambda-return target stack shape (full):", torch.stack(target, dim=1).shape)
-            # Compute actor loss using the full imagined features.
             actor_loss, loss_metrics = compute_actor_loss(
                 actor=self.actor,
                 features=full_imagined_features,
@@ -133,7 +124,7 @@ class ImaginedBehavior(nn.Module):
             actor_loss = torch.mean(actor_loss)
             metrics.update(loss_metrics)
             value_input = full_imagined_features
-        with torch.cuda.amp.autocast(self.use_amp):
+        with torch.amp.autocast("cuda", enabled=self.use_amp):
             predicted_value = self.value(value_input[:-1].detach())
             if getattr(self.configuration, "debug", False):
                 print("[DEBUG] predicted_value shape:", predicted_value.logits.shape)
@@ -165,7 +156,6 @@ class ImaginedBehavior(nn.Module):
             self.update_counter += 1
 
     def get_optimizer_state(self) -> Dict[str, Any]:
-        """Return the state dictionaries for the actor and value optimizers."""
         return {
             "actor_optimizer": self.actor_optimizer.state_dict(),
             "value_optimizer": self.value_optimizer.state_dict()

@@ -1,8 +1,3 @@
-"""
-Agent module for Dreamer-V3.
-Integrates the world model, actor-critic behavior, and exploration strategies.
-"""
-
 import numpy as np
 import torch
 import torch.nn as nn
@@ -64,16 +59,17 @@ class DreamerAgent(nn.Module):
                 self.metrics.setdefault("update_count", []).append(self.update_count)
             if self.current_step % self.log_schedule == 0:
                 for metric_name, metric_values in self.metrics.items():
-                    self.logger.scalar(metric_name, float(np.mean(metric_values)))
+                    # Ensure values are on CPU before using NumPy
+                    values_cpu = [v.cpu().item() if hasattr(v, "cpu") else v for v in metric_values]
+                    self.logger.scalar(metric_name, float(np.mean(values_cpu)))
                     self.metrics[metric_name] = []
                 if self.configuration.log_video_predictions:
                     video_prediction = self.world_model.generate_video(next(self.dataset))
                     self.logger.video("training_video", video_prediction.detach().cpu().numpy())
                 self.logger.write(fps=True)
-        policy_output, updated_state = self._compute_policy(observation, state, training)
-        if training:
             self.current_step += len(reset_flags)
             self.logger.global_step = self.configuration.action_repeat * self.current_step
+        policy_output, updated_state = self._compute_policy(observation, state, training)
         return policy_output, updated_state
 
     def _compute_policy(self,

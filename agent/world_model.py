@@ -6,12 +6,13 @@ and prediction heads for reconstruction, reward prediction, and continuation.
 
 import torch
 import torch.nn as nn
-from typing import Any, Dict, Tuple
+import torch.nn.functional as F
 import numpy as np
+from typing import Any, Dict, Tuple
 
 from agent.networks import MultiEncoder, RSSM, MultiDecoder, MLP, DistributionWrapper
 from utils.optimizer import Optimizer
-from utils.helper_functions import tensor_to_numpy, augment_image
+from utils.helper_functions import tensor_to_numpy, augment_image, lambda_return_target
 
 class WorldModel(nn.Module):
     def __init__(self,
@@ -24,6 +25,7 @@ class WorldModel(nn.Module):
         self.use_amp = (configuration.precision == 16)
         self.configuration = configuration
 
+        # Determine input shapes from the observation space.
         if hasattr(observation_space, "spaces"):
             input_shapes = {key: tuple(value.shape) for key, value in observation_space.spaces.items()}
         else:
@@ -32,6 +34,7 @@ class WorldModel(nn.Module):
         if getattr(self.configuration, "debug", False):
             print("Input shapes:", input_shapes)
 
+        # Encoder: maps raw observations into an embedding.
         self.encoder = MultiEncoder(
             input_shapes,
             output_dimension=configuration.encoder["output_dimension"],
@@ -39,6 +42,15 @@ class WorldModel(nn.Module):
         )
         self.embedding_dimension = configuration.encoder["output_dimension"]
 
+        # Choose latent representation: if using discrete, compute feature dimension accordingly.
+        if configuration.dynamics_use_discrete:
+            # For example, if discrete_latent_num=32 and discrete_latent_size=32,
+            # then feature_dimension = 32*32 + deterministic_dimension.
+            feature_dimension = configuration.discrete_latent_num * configuration.discrete_latent_size + configuration.dynamics_deterministic_dimension
+        else:
+            feature_dimension = configuration.dynamics_stochastic_dimension + configuration.dynamics_deterministic_dimension
+
+        # Dynamics model (RSSM) – note that the RSSM module should support both continuous and discrete latents.
         self.dynamics = RSSM(
             stoch_dimension=configuration.dynamics_stochastic_dimension,
             deter_dimension=configuration.dynamics_deterministic_dimension,
@@ -58,11 +70,7 @@ class WorldModel(nn.Module):
             use_orthogonal=configuration.use_orthogonal_initialization
         )
 
-        if configuration.dynamics_use_discrete:
-            feature_dimension = configuration.dynamics_stochastic_dimension * configuration.dynamics_use_discrete + configuration.dynamics_deterministic_dimension
-        else:
-            feature_dimension = configuration.dynamics_stochastic_dimension + configuration.dynamics_deterministic_dimension
-
+        # Heads: decoder for reconstruction, reward predictor, and continuation (termination) predictor.
         self.heads = nn.ModuleDict({
             "decoder": MultiDecoder(
                 feature_dimension,
@@ -115,30 +123,24 @@ class WorldModel(nn.Module):
 
     def preprocess(self, observations: Dict[str, Any]) -> Dict[str, torch.Tensor]:
         processed = {}
-        # Convert each observation key to a tensor.
         for key, value in observations.items():
             if key == "action":
-                # Convert actions to an integer tensor then to one-hot.
                 action_tensor = torch.tensor(value, device=self.configuration.computation_device, dtype=torch.long)
                 action_tensor = torch.nn.functional.one_hot(action_tensor, num_classes=self.configuration.number_of_possible_actions).float()
                 processed[key] = action_tensor
             else:
                 processed[key] = torch.tensor(value, device=self.configuration.computation_device, dtype=torch.float32)
-        # If "action" is missing, provide a default one-hot tensor.
         if "action" not in processed:
             processed["action"] = torch.zeros((self.configuration.sequence_length, self.configuration.number_of_possible_actions),
                                                 device=self.configuration.computation_device, dtype=torch.float32)
         if "image" in processed:
             processed["image"] = processed["image"] / 255.0
-            # If the image tensor is 5D: (B, T, H, W, C), permute to (B, T, C, H, W).
             if processed["image"].ndim == 5 and processed["image"].shape[-1] in [1, 3]:
                 processed["image"] = processed["image"].permute(0, 1, 4, 2, 3)
-            # Else if the image tensor is 3D: (H, W, C), permute to (C, H, W).
             elif processed["image"].ndim == 3 and processed["image"].shape[-1] in [1, 3]:
                 processed["image"] = processed["image"].permute(2, 0, 1)
             if getattr(self.configuration, "debug", False):
                 print("Preprocessed image shape:", processed["image"].shape)
-            # Optionally apply augmentation if enabled.
             if getattr(self.configuration, "augmentation_enabled", False):
                 crop_size = getattr(self.configuration, "augmentation_crop_size", 64)
                 processed["image"] = augment_image(processed["image"], crop_size)
@@ -155,18 +157,17 @@ class WorldModel(nn.Module):
         if getattr(self.configuration, "debug", False):
             print("Data['image'] shape after preprocessing:", data["image"].shape)
             print("Data['action'] shape after preprocessing:", data["action"].shape)
-        # Now data["action"] is a one-hot tensor.
-        with torch.cuda.amp.autocast(self.use_amp):
+        with torch.amp.autocast("cuda", enabled=self.use_amp):
             embeddings = self.encoder(data)
             if getattr(self.configuration, "debug", False):
                 print("Embeddings shape:", embeddings.shape)
             posterior, prior = self.dynamics.observe(embeddings, data["action"], data["is_first"])
-            kl_free = getattr(self.configuration, "kl_free", 0.0)
+            # Use a free bits threshold (e.g. 1.0) to prevent KL collapse.
+            kl_free = getattr(self.configuration, "kl_free", 1.0)
             dynamics_scale = getattr(self.configuration, "dynamics_loss_scale", 1.0)
             representation_scale = getattr(self.configuration, "representation_loss_scale", 1.0)
-            kl_loss, kl_value, dynamics_loss, representation_loss = self.dynamics.compute_kl_loss(
-                posterior, prior, kl_free, dynamics_scale, representation_scale
-            )
+            # Compute KL loss using a proper closed-form for Gaussians.
+            kl_loss, kl_value, dyn_loss, rep_loss = self.dynamics.compute_kl_loss(posterior, prior, kl_free, dynamics_scale, representation_scale)
             predictions = {}
             for head_name, head_module in self.heads.items():
                 propagate_gradient = head_name in self.configuration.gradient_head_keys
@@ -182,10 +183,6 @@ class WorldModel(nn.Module):
             for head_name, prediction in predictions.items():
                 if isinstance(prediction, dict):
                     losses[head_name] = -prediction["image"].log_prob(data["image"])
-                    if getattr(self.configuration, "debug", False):
-                        print(f"Loss for head '{head_name}' computed using conv branch")
-                        print("Prediction logits shape:", prediction["image"].logits.shape)
-                        print("Target shape:", data["image"].shape)
                 else:
                     losses[head_name] = -prediction.log_prob(data[head_name])
             scaled_losses = {name: loss * self.loss_scales.get(name, 1.0) for name, loss in losses.items()}
@@ -194,8 +191,8 @@ class WorldModel(nn.Module):
         metrics.update({f"{name}_loss": tensor_to_numpy(loss) for name, loss in losses.items()})
         metrics.update({
             "kl_loss": tensor_to_numpy(torch.mean(kl_value)),
-            "dynamics_loss": tensor_to_numpy(dynamics_loss),
-            "representation_loss": tensor_to_numpy(representation_loss)
+            "dynamics_loss": tensor_to_numpy(dyn_loss),
+            "representation_loss": tensor_to_numpy(rep_loss)
         })
         posterior_detached = {key: value.detach() for key, value in posterior.items()}
         context = {

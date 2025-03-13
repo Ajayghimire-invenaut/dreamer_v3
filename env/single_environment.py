@@ -2,50 +2,56 @@ import gym
 from gym.wrappers import TimeLimit
 import numpy as np
 import cv2
+from typing import Any, Dict
+import time
+import logging
+
+# Logger setup: Initialize a logger for the module.
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)  # Change to DEBUG for more detailed logs.
+if not logger.handlers:
+    ch = logging.StreamHandler()
+    ch.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+    logger.addHandler(ch)
 
 class SingleEnvironment:
     def __init__(self, task_name: str, action_repeat: int = 2, seed: int = 42) -> None:
-        self.environment = gym.make("CartPole-v1", render_mode="rgb_array")
+        # Create the environment with the new_step_api enabled.
+        self.environment = gym.make("CartPole-v1", render_mode="rgb_array", new_step_api=True)
         self.environment = TimeLimit(self.environment, max_episode_steps=500)
         self.environment.reset(seed=seed)
         self.environment.action_space.seed(seed)
         self.action_repeat = action_repeat
         self.identifier = "environment_0"
-        # Override observation_space to be image-based (e.g. 64x64 RGB)
+        # Override observation_space to be image-based (e.g. 64x64 RGB).
         self.observation_space = gym.spaces.Box(low=0, high=255, shape=(64, 64, 3), dtype=np.uint8)
         self.action_space = self.environment.action_space
 
-<<<<<<< HEAD
-    def reset(self) -> dict:
-        reset_result = self.environment.reset(seed=None)
-        observation = reset_result[0] if isinstance(reset_result, tuple) else reset_result
-=======
     def reset(self) -> Dict[str, Any]:
+        start_time = time.time()
         reset_result = self.environment.reset(seed=None)
-        # If gym.reset() returns a tuple (observation, info), use only observation.
-        if isinstance(reset_result, tuple):
-            observation = reset_result[0]
-        else:
-            observation = reset_result
->>>>>>> 00944a6f9d5ea4ddf71a6da8310193cc906055e4
+        elapsed = time.time() - start_time
+        logger.info("Environment reset took %.4f seconds", elapsed)
+        
+        observation = reset_result[0] if isinstance(reset_result, tuple) else reset_result
         img = self.environment.render()
         processed_img = self._process_image(img)
-        return {"image": processed_img,
-                "is_first": np.array(True),
-                "is_terminal": np.array(False),
-                "discount": np.array(1.0)}
+        return {
+            "image": processed_img,
+            "is_first": np.array(True),
+            "is_terminal": np.array(False),
+            "discount": np.array(1.0),
+        }
 
-    def step(self, action: any):
+    def step(self, action: Any):
+        step_start = time.time()
         cumulative_reward = 0.0
         done = False
         info = {}
-        # Loop over action repeats.
+
         for _ in range(self.action_repeat):
-<<<<<<< HEAD
-=======
-            # Get the result from step.
->>>>>>> 00944a6f9d5ea4ddf71a6da8310193cc906055e4
             result = self.environment.step(action)
+            # Process the result depending on the number of returned values.
             if len(result) == 5:
                 observation, reward, terminated, truncated, info = result
                 done = terminated or truncated
@@ -53,54 +59,49 @@ class SingleEnvironment:
                 observation, reward, done, info = result
             else:
                 raise ValueError("Unexpected number of values returned from environment.step")
+            
             cumulative_reward += reward
             if done:
                 break
+
+        logger.info("Environment step took %.4f seconds", time.time() - step_start)
+
         img = self.environment.render()
         processed_img = self._process_image(img)
         return self._format_observation(processed_img, is_first=False), cumulative_reward, done, info
 
-<<<<<<< HEAD
-    def _process_image(self, img: any) -> np.ndarray:
+    def _process_image(self, img: Any) -> np.ndarray:
+        start_time = time.time()  # Start timing.
         try:
             if img is None:
-                print("Warning: render() returned None. Creating a dummy image.")
+                logger.warning("render() returned None. Creating a dummy image.")
                 img = np.zeros((64, 64, 3), dtype=np.uint8)
             else:
                 img = np.array(img)
+            if img.ndim == 4 and img.shape[0] == 1:
+                img = np.squeeze(img, axis=0)
+                logger.debug("Squeezed image shape: %s", img.shape)
+            logger.debug("Received image of type %s with shape %s and size %s", type(img), img.shape, img.size)
             if img.size == 0 or img.ndim < 2 or img.shape[0] == 0 or img.shape[1] == 0:
-                print("Warning: render() returned an invalid image. Creating a dummy image.")
+                logger.warning("render() returned an invalid image. Creating a dummy image.")
                 img = np.zeros((64, 64, 3), dtype=np.uint8)
+            # Time the resize operation.
+            resize_start = time.time()
             resized = cv2.resize(img, (64, 64))
+            logger.debug("cv2.resize took %.4f seconds", time.time() - resize_start)
             return resized.astype(np.uint8)
         except Exception as e:
-            print("Error in _process_image:", e)
+            logger.error("Error in _process_image: %s", e)
             return np.zeros((64, 64, 3), dtype=np.uint8)
-=======
-    def _process_image(self, img: Any) -> np.ndarray:
-      try:
-          if img is None:
-              print("Warning: render() returned None. Creating a dummy image.")
-              img = np.zeros((64, 64, 3), dtype=np.uint8)
-          else:
-              img = np.array(img)
-          # Check if the image has at least 2 dimensions and non-zero size in the first two dimensions.
-          if img.ndim < 2 or img.shape[0] == 0 or img.shape[1] == 0:
-              print("Warning: render() returned an invalid image shape. Creating a dummy image.")
-              img = np.zeros((64, 64, 3), dtype=np.uint8)
-          resized = cv2.resize(img, (64, 64))
-          return resized.astype(np.uint8)
-      except Exception as e:
-          print("Error in _process_image:", e)
-          return np.zeros((64, 64, 3), dtype=np.uint8)
->>>>>>> 00944a6f9d5ea4ddf71a6da8310193cc906055e4
+        finally:
+            logger.debug("Total _process_image took %.4f seconds", time.time() - start_time)
 
     def _format_observation(self, processed_img: np.ndarray, is_first: bool) -> dict:
         return {
             "image": processed_img,
             "is_first": np.array(is_first, dtype=bool),
             "is_terminal": np.array(False, dtype=bool),
-            "discount": np.array(1.0, dtype=np.float32)
+            "discount": np.array(1.0, dtype=np.float32),
         }
 
     def close(self) -> None:

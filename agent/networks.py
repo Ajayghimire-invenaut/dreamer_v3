@@ -56,20 +56,18 @@ class MultiEncoder(nn.Module):
         if self.is_image:
             image = observations["image"]
             if getattr(observations, "debug", False):
-                print("MultiEncoder received image with shape:", image.shape)
+                print("[DEBUG MultiEncoder] received image shape:", image.shape, flush=True)
             if image.dim() == 5:
                 if image.shape[-1] in [1, 3]:
                     image = image.permute(0, 1, 4, 2, 3)
-                    if getattr(observations, "debug", False):
-                        print("Permuted 5D image to:", image.shape)
+                    print("[DEBUG MultiEncoder] permuted 5D image shape:", image.shape, flush=True)
                 B, T, C, H, W = image.shape
                 image = image.reshape(B * T, C, H, W)
                 features = self.convolutional_layers(image)
-                flattened = features.view(features.size(0), -1)
+                flattened = features.reshape(features.size(0), -1)
                 out = self.fc(flattened)
-                out = out.view(B, T, -1)
-                if getattr(observations, "debug", False):
-                    print("MultiEncoder output shape (batched sequence):", out.shape)
+                out = out.reshape(B, T, -1)
+                print("[DEBUG MultiEncoder] output shape (batched sequence):", out.shape, flush=True)
                 return out
             elif image.dim() == 3:
                 if image.shape[-1] in [1, 3]:
@@ -78,10 +76,9 @@ class MultiEncoder(nn.Module):
             elif image.dim() == 4 and image.shape[-1] in [1, 3]:
                 image = image.permute(0, 3, 1, 2)
             features = self.convolutional_layers(image)
-            flattened = features.view(features.size(0), -1)
+            flattened = features.reshape(features.size(0), -1)
             out = self.fc(flattened)
-            if getattr(observations, "debug", False):
-                print("MultiEncoder output shape (batched):", out.shape)
+            print("[DEBUG MultiEncoder] output shape (batched):", out.shape, flush=True)
             return out
         else:
             return self.fc(observations["image"])
@@ -157,18 +154,36 @@ class RSSM(nn.Module):
                      previous_action: Optional[torch.Tensor],
                      embedding: torch.Tensor,
                      is_first: torch.Tensor) -> Tuple[Dict[str, torch.Tensor], None]:
+        # Ensure embedding is 2D (B, D)
         if embedding.dim() == 1:
             embedding = embedding.unsqueeze(0)
-        if previous_action is None:
+        # If embedding has an extra time dimension of size 1, squeeze it.
+        if embedding.dim() == 3 and embedding.size(1) == 1:
+            embedding = embedding.squeeze(1)
+            print("[DEBUG observe_step] Squeezed embedding to shape:", embedding.shape, flush=True)
+        
+        # If previous_action is provided as a 3D tensor (B, T, A), take only the last time step.
+        if previous_action is not None and previous_action.dim() == 3:
+            print(f"[DEBUG observe_step] previous_action before squeezing: {previous_action.shape}", flush=True)
+            previous_action = previous_action[:, -1, :]
+            print(f"[DEBUG observe_step] previous_action after squeezing: {previous_action.shape}", flush=True)
+        elif previous_action is None:
             previous_action = torch.zeros(embedding.size(0), self.number_of_actions, device=embedding.device)
         elif previous_action.dim() == 1:
             previous_action = torch.nn.functional.one_hot(previous_action.long(), num_classes=self.number_of_actions).float()
         elif previous_action.dim() < 2:
             previous_action = previous_action.unsqueeze(0)
             previous_action = torch.nn.functional.one_hot(previous_action.long(), num_classes=self.number_of_actions).float()
-        combined = torch.cat([embedding, previous_action], dim=-1).unsqueeze(1)
+
+        print(f"[DEBUG observe_step] embedding shape: {embedding.shape}, previous_action shape: {previous_action.shape}", flush=True)
+        combined = torch.cat([embedding, previous_action], dim=-1)
+        print(f"[DEBUG observe_step] combined shape before unsqueeze: {combined.shape}", flush=True)
+        combined = combined.unsqueeze(1)  # shape becomes (B, 1, D+A)
+        print(f"[DEBUG observe_step] combined shape after unsqueeze: {combined.shape}", flush=True)
+        
         output, _ = self.gru(combined)
         deter = output.squeeze(1)
+        
         if self.use_discrete:
             logits = self.logits_layer(deter)
             B = logits.shape[0]
@@ -182,12 +197,45 @@ class RSSM(nn.Module):
 
     def get_features(self, state: Dict[str, torch.Tensor]) -> torch.Tensor:
         if self.use_discrete:
-            # Convert logits to probabilities and flatten.
+            # Compute probabilities from logits.
             probs = torch.softmax(state["logits"], dim=-1)
-            probs_flat = probs.view(probs.shape[0], -1)
-            return torch.cat([state["deter"], probs_flat], dim=-1)
+            print(f"[DEBUG get_features] raw probs shape: {probs.shape}", flush=True)
+            if probs.ndim == 4:
+                # Expected shape: [B, T, dnum, dsize]
+                B, T, dnum, dsize = probs.shape
+                try:
+                    probs_flat = probs.reshape(B, T, -1)
+                    print(f"[DEBUG get_features] probs_flat shape: {probs_flat.shape}", flush=True)
+                except Exception as e:
+                    print("[ERROR get_features] Cannot reshape probs:", e, flush=True)
+                    raise
+            elif probs.ndim == 3:
+                # If time dimension is missing, add one.
+                probs = probs.unsqueeze(1)
+                probs_flat = probs.reshape(probs.shape[0], 1, -1)
+                print(f"[DEBUG get_features] Added time dimension, probs_flat shape: {probs_flat.shape}", flush=True)
+            else:
+                probs_flat = probs
+            # Get deterministic state.
+            deter = state["deter"]
+            if deter.ndim == 2:
+                # Add time dimension of size 1.
+                deter = deter.unsqueeze(1)
+                print(f"[DEBUG get_features] Expanded 'deter' to shape: {deter.shape}", flush=True)
+            # If time dimensions differ, broadcast the one with time=1.
+            if deter.shape[1] != probs_flat.shape[1]:
+                if deter.shape[1] == 1:
+                    deter = deter.expand(deter.shape[0], probs_flat.shape[1], deter.shape[2])
+                    print(f"[DEBUG get_features] Broadcasted 'deter' to shape: {deter.shape}", flush=True)
+                elif probs_flat.shape[1] == 1:
+                    probs_flat = probs_flat.expand(probs_flat.shape[0], deter.shape[1], probs_flat.shape[2])
+                    print(f"[DEBUG get_features] Broadcasted 'probs_flat' to shape: {probs_flat.shape}", flush=True)
+            # Final feature concatenation.
+            features = torch.cat([deter, probs_flat], dim=-1)
+            print(f"[DEBUG get_features] features shape: {features.shape}", flush=True)
+            return features
         if "deter" not in state:
-            print("Warning: 'deter' not in state. Keys present:", state.keys())
+            print("Warning: 'deter' not in state. Keys present:", state.keys(), flush=True)
             return state["mean"]
         return torch.cat([state["deter"], state["mean"]], dim=-1)
 
@@ -235,7 +283,7 @@ class MultiDecoder(nn.Module):
         else:
             self.output_shape = raw_output_shape
         if getattr(self, "debug", False):
-            print("MultiDecoder output_shape set to:", self.output_shape)
+            print("[DEBUG MultiDecoder] output_shape set to:", self.output_shape, flush=True)
         if len(self.output_shape) == 3:
             self.decoder_type = "conv"
             self.fc = nn.Linear(feature_dimension, 256 * 4 * 4)
@@ -270,31 +318,31 @@ class MultiDecoder(nn.Module):
             if features.dim() == 3:
                 B, T, D = features.shape
                 if self.debug:
-                    print("MultiDecoder conv branch: features shape (B, T, D):", features.shape)
-                features = features.view(B * T, D)
+                    print("[DEBUG MultiDecoder] conv branch input features shape (B, T, D):", features.shape, flush=True)
+                features = features.reshape(B * T, D)
                 x = self.fc(features)
                 if self.debug:
-                    print("After fc, shape:", x.shape)
-                x = x.view(B * T, 256, 4, 4)
+                    print("[DEBUG MultiDecoder] after fc shape:", x.shape, flush=True)
+                x = x.reshape(B * T, 256, 4, 4)
                 if self.debug:
-                    print("Reshaped to:", x.shape)
+                    print("[DEBUG MultiDecoder] reshaped to:", x.shape, flush=True)
                 reconstruction = self.deconv_layers(x)
                 if self.debug:
-                    print("After deconv, shape:", reconstruction.shape)
-                reconstruction = reconstruction.view(B, T, *reconstruction.shape[1:])
+                    print("[DEBUG MultiDecoder] after deconv shape:", reconstruction.shape, flush=True)
+                reconstruction = reconstruction.reshape(B, T, *reconstruction.shape[1:])
                 if self.debug:
-                    print("MultiDecoder conv branch final reconstruction shape:", reconstruction.shape)
+                    print("[DEBUG MultiDecoder] final reconstruction shape:", reconstruction.shape, flush=True)
             else:
                 x = self.fc(features)
-                x = x.view(features.size(0), 256, 4, 4)
+                x = x.reshape(features.size(0), 256, 4, 4)
                 reconstruction = self.deconv_layers(x)
             return {"image": DistributionWrapper(reconstruction)}
         else:
             if features.dim() == 3:
                 B, T, D = features.shape
-                features = features.view(B * T, D)
+                features = features.reshape(B * T, D)
                 out = self.decoder(features)
-                out = out.view(B, T, *self.output_shape)
+                out = out.reshape(B, T, *self.output_shape)
             else:
                 out = self.decoder(features)
             return {"image": DistributionWrapper(out)}
@@ -340,6 +388,7 @@ class DistributionWrapper:
     def __init__(self, logits: torch.Tensor, dist_type: str = "gaussian") -> None:
         self.logits = logits
         self.dist_type = dist_type
+        print(f"[DEBUG DistributionWrapper] initialized with logits shape: {self.logits.shape} and type: {self.dist_type}", flush=True)
 
     def log_prob(self, target: torch.Tensor) -> torch.Tensor:
         if self.dist_type == "gaussian":
@@ -349,11 +398,11 @@ class DistributionWrapper:
                 target = target.transpose(0, 1)
             return -((self.logits - target) ** 2).mean()
         elif self.dist_type == "symlog_disc":
-            # Discretize target (for example by rounding) to obtain integer bins.
-            # In a full implementation, two-hot encoding is used.
             target = target.long().squeeze(-1)
-            logits = self.logits.view(-1, self.logits.shape[-1])
-            return -nn.functional.cross_entropy(logits, target.view(-1), reduction='mean')
+            logits = self.logits.reshape(-1, self.logits.shape[-1])
+            return -nn.functional.cross_entropy(logits, target.reshape(-1), reduction='mean')
+        elif self.dist_type == "binary":
+            return -nn.functional.binary_cross_entropy_with_logits(self.logits, target, reduction='mean')
         else:
             raise ValueError("Unsupported distribution type")
 
@@ -363,6 +412,8 @@ class DistributionWrapper:
         elif self.dist_type == "symlog_disc":
             mode = torch.argmax(self.logits, dim=-1)
             return mode.float()
+        elif self.dist_type == "binary":
+            return (self.logits >= 0).float()
         else:
             raise ValueError("Unsupported distribution type")
 
@@ -374,6 +425,9 @@ class DistributionWrapper:
             probs = torch.softmax(self.logits, dim=-1)
             distribution = torch.distributions.Categorical(probs=probs)
             return distribution.sample().float()
+        elif self.dist_type == "binary":
+            probs = torch.sigmoid(self.logits)
+            return torch.bernoulli(probs)
         else:
             raise ValueError("Unsupported distribution type")
 
@@ -385,5 +439,22 @@ class DistributionWrapper:
         elif self.dist_type == "symlog_disc":
             probs = torch.softmax(self.logits, dim=-1)
             return torch.distributions.Categorical(probs=probs).entropy()
+        elif self.dist_type == "binary":
+            p = torch.sigmoid(self.logits)
+            entropy = - p * torch.log(p + 1e-8) - (1 - p) * torch.log(1 - p + 1e-8)
+            return entropy
         else:
             raise ValueError("Unsupported distribution type")
+
+class RewardEMA:
+    def __init__(self, device: Any, alpha: float = 1e-2) -> None:
+        self.device = device
+        self.alpha = alpha
+        self.quantile_range = torch.tensor([0.05, 0.95], device=device)
+    def __call__(self, input_tensor: torch.Tensor, ema_values: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        flattened = input_tensor.detach().flatten()
+        quantiles = torch.quantile(flattened, self.quantile_range)
+        ema_values[:] = self.alpha * quantiles + (1 - self.alpha) * ema_values
+        scale = torch.clamp(ema_values[1] - ema_values[0], min=1.0)
+        offset = ema_values[0]
+        return offset.detach(), scale.detach()

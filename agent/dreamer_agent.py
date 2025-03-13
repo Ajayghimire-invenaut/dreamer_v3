@@ -1,8 +1,7 @@
-import numpy as np
 import torch
 import torch.nn as nn
+import numpy as np
 from typing import Any, Dict, Generator, Optional, Tuple
-
 from agent.behavior import ImaginedBehavior
 from agent.random_explorer import RandomExplorer
 from agent.world_model import WorldModel
@@ -20,7 +19,7 @@ class DreamerAgent(nn.Module):
         self.dataset = dataset
 
         self.log_schedule = configuration.logging_interval
-        self.training_schedule = int((configuration.batch_size * configuration.sequence_length) / configuration.training_update_ratio)
+        self.training_updates = configuration.training_updates_per_forward
         self.pretrain_once = True
         self.exploration_schedule = configuration.exploration_termination_step // configuration.action_repeat
 
@@ -52,14 +51,12 @@ class DreamerAgent(nn.Module):
                 state: Optional[Any] = None,
                 training: bool = True) -> Tuple[Dict[str, Any], Any]:
         if training:
-            num_updates = self.configuration.number_of_pretraining_updates if self.pretrain_once else self.training_schedule
-            for _ in range(num_updates):
+            for _ in range(self.training_updates):
                 self._train(next(self.dataset))
                 self.update_count += 1
                 self.metrics.setdefault("update_count", []).append(self.update_count)
             if self.current_step % self.log_schedule == 0:
                 for metric_name, metric_values in self.metrics.items():
-                    # Ensure values are on CPU before using NumPy
                     values_cpu = [v.cpu().item() if hasattr(v, "cpu") else v for v in metric_values]
                     self.logger.scalar(metric_name, float(np.mean(values_cpu)))
                     self.metrics[metric_name] = []
@@ -67,8 +64,7 @@ class DreamerAgent(nn.Module):
                     video_prediction = self.world_model.generate_video(next(self.dataset))
                     self.logger.video("training_video", video_prediction.detach().cpu().numpy())
                 self.logger.write(fps=True)
-            self.current_step += len(reset_flags)
-            self.logger.global_step = self.configuration.action_repeat * self.current_step
+            # Note: current_step should be updated in simulate_episode.
         policy_output, updated_state = self._compute_policy(observation, state, training)
         return policy_output, updated_state
 
@@ -115,10 +111,7 @@ class DreamerAgent(nn.Module):
         metrics: Dict[str, float] = {}
         posterior, context, world_model_metrics = self.world_model.train_step(batch_data)
         metrics.update(world_model_metrics)
-        reward_function = lambda features, state, action: self.world_model.heads["reward"](
-            self.world_model.dynamics.get_features(state)
-        ).mode()
-        behavior_metrics = self.task_behavior.train_step(posterior, reward_function)[-1]
+        behavior_metrics = self.task_behavior.train_step(posterior, None)[-1]
         metrics.update(behavior_metrics)
         if self.configuration.actor.get("exploration_behavior", "greedy") != "greedy":
             exploration_metrics = self.explorer.train(posterior, context, batch_data)[-1]

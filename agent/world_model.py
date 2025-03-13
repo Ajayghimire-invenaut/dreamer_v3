@@ -126,7 +126,10 @@ class WorldModel(nn.Module):
         for key, value in observations.items():
             if key == "action":
                 action_tensor = torch.tensor(value, device=self.configuration.computation_device, dtype=torch.long)
+                # Print the original action values and the expected number of actions.
+                print(f"[DEBUG preprocess] Raw action shape: {action_tensor.shape}, expected num_actions: {self.configuration.number_of_possible_actions}", flush=True)
                 action_tensor = torch.nn.functional.one_hot(action_tensor, num_classes=self.configuration.number_of_possible_actions).float()
+                print(f"[DEBUG preprocess] One-hot action shape: {action_tensor.shape}", flush=True)
                 processed[key] = action_tensor
             else:
                 processed[key] = torch.tensor(value, device=self.configuration.computation_device, dtype=torch.float32)

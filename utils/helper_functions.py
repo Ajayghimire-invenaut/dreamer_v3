@@ -1,136 +1,147 @@
-"""
-Helper functions and scheduling utilities for Dreamer-V3.
-
-This module includes:
-  - Scheduling classes: Every, Until, Once.
-  - Deterministic utilities: set_random_seed, enable_deterministic_mode.
-  - Data metrics: count_episode_steps, tensor_stats.
-  - Loss and target computations: static_scan_imagine, lambda_return_target, compute_actor_loss.
-  - Advanced data augmentation: augment_image.
-  - OneHotDistribution helper.
-  - RewardEMA for reward normalization.
-  - tensor_to_numpy utility.
-"""
-
-import random
-import time
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
-from typing import Any, Dict, List, Tuple
+import random
+from typing import Any, Dict, List, Tuple, Optional
+import math
 
-# Scheduling Utilities
-class Every:
-    def __init__(self, interval: int) -> None:
-        self.interval = interval
-    def __call__(self, current_step: int) -> bool:
-        return current_step % self.interval == 0
+#########################################
+# Reward Objective Module with Debug
+#########################################
+class RewardObjective(nn.Module):
+    def __init__(self, clip_value: float = 5.0, alpha: float = 0.01):
+        """
+        Reward objective that compares the predicted reward against the ground-truth,
+        uses an exponential moving average (EMA) as a running baseline, and clips the error.
+        """
+        super(RewardObjective, self).__init__()
+        self.clip_value = clip_value
+        self.alpha = alpha
+        self.register_buffer("baseline", torch.tensor(0.0))
+    
+    def forward(self, imagined_features: torch.Tensor, world_model: Any, ground_truth_reward: torch.Tensor = None) -> torch.Tensor:
+        # Predict reward from the imagined features using the reward head.
+        predicted_reward = world_model.heads["reward"](imagined_features).mode()
+        print(f"[DEBUG RewardObjective] predicted_reward mean: {predicted_reward.mean().item():.4f}, std: {predicted_reward.std().item():.4f}", flush=True)
+        
+        if ground_truth_reward is not None:
+            error = predicted_reward - ground_truth_reward
+            print(f"[DEBUG RewardObjective] ground_truth_reward mean: {ground_truth_reward.mean().item():.4f}, std: {ground_truth_reward.std().item():.4f}", flush=True)
+            print(f"[DEBUG RewardObjective] error mean: {error.mean().item():.4f}, std: {error.std().item():.4f}", flush=True)
+            self.baseline = self.alpha * error.mean() + (1 - self.alpha) * self.baseline
+            print(f"[DEBUG RewardObjective] updated baseline: {self.baseline.item():.4f}", flush=True)
+            error = error - self.baseline
+            error = torch.clamp(error, -self.clip_value, self.clip_value)
+            intrinsic_reward = torch.abs(error)
+        else:
+            intrinsic_reward = torch.clamp(predicted_reward, -self.clip_value, self.clip_value)
+        
+        print(f"[DEBUG RewardObjective] intrinsic_reward mean: {intrinsic_reward.mean().item():.4f}, std: {intrinsic_reward.std().item():.4f}", flush=True)
+        return intrinsic_reward
 
-class Until:
-    def __init__(self, end_step: int) -> None:
-        self.end_step = end_step
-    def __call__(self, current_step: int) -> bool:
-        return current_step < self.end_step
-
-class Once:
-    def __init__(self) -> None:
-        self.done = False
-    def __call__(self) -> bool:
-        if not self.done:
-            self.done = True
-            return True
-        return False
-    def reset_flag(self) -> None:
-        self.done = False
-
-# Deterministic Setup
-def set_random_seed(seed: int) -> None:
-    np.random.seed(seed)
-    random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-def enable_deterministic_mode() -> None:
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-# Data Metrics
-def count_episode_steps(directory: Any) -> int:
-    from pathlib import Path
-    directory = Path(directory)
-    total = 0
-    for file in directory.glob("*.npz"):
-        try:
-            data = np.load(file)
-            total += len(data["reward"]) - 1
-        except Exception:
-            continue
-    return total
-
-def tensor_stats(tensor: torch.Tensor, name: str) -> Dict[str, float]:
-    return {f"{name}_mean": tensor.mean().item(), f"{name}_std": tensor.std().item()}
-
-# Imagined Trajectory Rollout
-def static_scan_imagine(start_state: Any, horizon: int, dynamics_model: Any, action_dim: int) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], torch.Tensor]:
+#########################################
+# Prediction Step: Decoder + Encoder
+#########################################
+def predict_next_embedding(state: Dict[str, torch.Tensor],
+                           action: torch.Tensor,
+                           world_model: Any,
+                           encoder: Any) -> torch.Tensor:
     """
-    Roll out the dynamics model for imagined trajectories.
-    
-    (In the official implementation, the model is rolled out by iteratively sampling actions.)
-    Here we simulate this by returning zeroed tensors with the correct shapes.
-    
-    Args:
-      start_state: The starting state (unused in this simplified version).
-      horizon: Number of time steps to simulate.
-      dynamics_model: An instance with attributes stoch_dimension, deter_dimension, and device.
-      action_dim: The dimension of the actions (number of possible actions).
-    
-    Returns:
-      imagined_features: Tensor [horizon, batch, (stoch_dimension + deter_dimension)].
-      imagined_state: Dict with "mean", "std", and "deter" each of shape [horizon, batch, dimension].
-      imagined_actions: Dummy tensor of shape [horizon, batch, action_dim].
+    Uses the world model's decoder head to predict the next observation,
+    then passes it through the encoder to obtain the next latent embedding.
     """
-    batch_size = 32  # Make sure this matches your training batch size.
-    total_dimension = dynamics_model.stoch_dimension + dynamics_model.deter_dimension
-    imagined_features = torch.zeros(horizon, batch_size, total_dimension, device=dynamics_model.device)
-    imagined_state = {
-        "mean": torch.zeros(horizon, batch_size, dynamics_model.stoch_dimension, device=dynamics_model.device),
-        "std": torch.ones(horizon, batch_size, dynamics_model.stoch_dimension, device=dynamics_model.device),
-        "deter": torch.zeros(horizon, batch_size, dynamics_model.deter_dimension, device=dynamics_model.device)
-    }
-    imagined_actions = torch.zeros(horizon, batch_size, action_dim, device=dynamics_model.device)
-    return imagined_features, imagined_state, imagined_actions
+    # Use the dynamics (RSSM) to get features from the current state.
+    features = world_model.dynamics.get_features(state)
+    predicted_obs_distribution = world_model.heads["decoder"](features)
+    predicted_obs = predicted_obs_distribution["image"].mode()  # or .sample() if desired
+    print(f"[DEBUG predict_next_embedding] predicted_obs shape: {predicted_obs.shape}", flush=True)
+    predicted_embedding = encoder({"image": predicted_obs})
+    print(f"[DEBUG predict_next_embedding] predicted_embedding mean: {predicted_embedding.mean().item():.4f}, std: {predicted_embedding.std().item():.4f}", flush=True)
+    return predicted_embedding
 
-# Loss and Target Computations
+#########################################
+# Rollout (Imagination) Step with Debug
+#########################################
+def imagine_trajectory(start_state: Dict[str, torch.Tensor],
+                        horizon: int,
+                        dynamics_model: Any,
+                        actor: Any,
+                        world_model: Any,
+                        encoder: Any,
+                        configuration: Any) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], torch.Tensor]:
+      """
+      Rolls out the dynamics model for a given horizon using the actor to sample actions.
+      Instead of reusing current features as the next embedding, this function uses
+      predict_next_embedding to generate the next latent embedding.
+      The updated version forces the time dimension to be 1 at each step.
+      """
+      batch_size = start_state["deter"].shape[0]
+      feature_list = []
+      state_history = {key: [] for key in start_state.keys()}
+      actions_list = []
+      state = start_state
+
+      for t in range(horizon):
+          # Get features from the current state.
+          features = dynamics_model.get_features(state)
+          print(f"[DEBUG imagine_trajectory] Step {t}: raw features shape: {features.shape}", flush=True)
+          # Force features to have a time dimension of 1.
+          if features.dim() == 3 and features.size(1) != 1:
+              features = features[:, -1:, :]  # take only the last time step
+              print(f"[DEBUG imagine_trajectory] Step {t}: reduced features shape: {features.shape}", flush=True)
+          feature_list.append(features)
+
+          # Sample action from the actor.
+          actor_dist = actor(features)
+          action = actor_dist.sample()
+          actions_list.append(action)
+          print(f"[DEBUG imagine_trajectory] Step {t}: action shape: {action.shape}", flush=True)
+          
+          # Predict the next latent embedding using the decoder->encoder loop.
+          predicted_embedding = predict_next_embedding(state, action, world_model, encoder)
+          # If predicted_embedding has a time dimension > 1, reduce it to the last step.
+          if predicted_embedding.dim() == 3 and predicted_embedding.size(1) != 1:
+              predicted_embedding = predicted_embedding[:, -1, :]
+              print(f"[DEBUG imagine_trajectory] Step {t}: reduced predicted_embedding shape: {predicted_embedding.shape}", flush=True)
+          
+          # Update the state using observe_step. The 'previous_action' here is action.
+          state, _ = dynamics_model.observe_step(
+              state, action, predicted_embedding, torch.ones(batch_size, device=dynamics_model.device)
+          )
+          for key, value in state.items():
+              state_history[key].append(value)
+      
+      # Stack along the new time dimension.
+      try:
+          imagined_features = torch.stack(feature_list, dim=0)  # Expected shape: (horizon, B, 1, feature_dim)
+      except Exception as e:
+          print(f"[ERROR imagine_trajectory] Error stacking feature_list: {e}", flush=True)
+          raise
+
+      imagined_actions = torch.stack(actions_list, dim=0)  # shape: (horizon, B, action_dim)
+      imagined_state = {key: torch.stack(vals, dim=0) for key, vals in state_history.items()}
+
+      print(f"[DEBUG imagine_trajectory] Final imagined_features shape: {imagined_features.shape}", flush=True)
+      print(f"[DEBUG imagine_trajectory] Final imagined_actions shape: {imagined_actions.shape}", flush=True)
+      
+      return imagined_features, imagined_state, imagined_actions
+
+#########################################
+# Lambda-Return Target and Other Utilities
+#########################################
 def lambda_return_target(reward: torch.Tensor,
                          value: torch.Tensor,
                          discount: float,
                          lambda_value: float,
                          normalize: bool = True) -> Tuple[List[torch.Tensor], torch.Tensor, torch.Tensor]:
-    """
-    Compute lambda-return targets and optionally normalize them.
-    
-    Instead of clamping the return using free nats, this implementation computes the recursive return and then
-    normalizes it by subtracting the mean and dividing by max(std, 1.0).
-    
-    Args:
-      reward: Tensor of shape [T, B, 1].
-      value: Tensor of shape [T, B, 1].
-      discount: Discount factor (e.g. 0.997).
-      lambda_value: Lambda parameter (e.g. 0.95).
-      normalize: Whether to normalize the returns.
-      
-    Returns:
-      target: List of T tensors.
-      weights: Tensor of shape [T, B] (all ones).
-      baseline: The original value tensor.
-    """
     T, B, _ = reward.shape
     returns: List[torch.Tensor] = [None] * T
     next_return = value[-1]
     for t in reversed(range(T)):
         next_return = reward[t] + discount * ((1 - lambda_value) * value[t] + lambda_value * next_return)
         returns[t] = next_return
-    returns_tensor = torch.stack(returns, dim=0)  # Shape [T, B, 1]
+    returns_tensor = torch.stack(returns, dim=0)
     if normalize:
         mean = returns_tensor.mean()
         std = returns_tensor.std()
@@ -148,24 +159,7 @@ def compute_actor_loss(actor: Any,
                        baseline: torch.Tensor,
                        value_network: Any,
                        configuration: Any) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """
-    Compute actor loss with advantage estimation and entropy bonus.
-    
-    Args:
-      actor: Actor network.
-      features: Features from world model.
-      actions: Imagined actions.
-      target: List of lambda-return targets.
-      weights: Weight tensor.
-      baseline: Baseline value estimates.
-      value_network: Critic network.
-      configuration: Configuration with hyperparameters.
-    
-    Returns:
-      actor_loss: Scalar tensor.
-      metrics: Dict with metrics.
-    """
-    target_stack = torch.stack(target, dim=0)  # Shape [T, B, 1]
+    target_stack = torch.stack(target, dim=0)
     advantage = target_stack - baseline
     dist = actor(features)
     log_prob = dist.log_prob(actions)
@@ -175,18 +169,10 @@ def compute_actor_loss(actor: Any,
     metrics = {"actor_loss": actor_loss.item(), "actor_entropy": entropy.item()}
     return actor_loss, metrics
 
-# Advanced Data Augmentation
+def tensor_stats(tensor: torch.Tensor, name: str) -> Dict[str, float]:
+    return {f"{name}_mean": tensor.mean().item(), f"{name}_std": tensor.std().item()}
+
 def augment_image(image: torch.Tensor, crop_size: int) -> torch.Tensor:
-    """
-    Apply advanced data augmentation: random crop, horizontal flip, brightness/contrast.
-    
-    Args:
-      image: Tensor [B, H, W, C].
-      crop_size: Crop size.
-    
-    Returns:
-      Augmented image tensor.
-    """
     if image.dim() != 4:
         return image
     B, H, W, C = image.shape
@@ -203,7 +189,35 @@ def augment_image(image: torch.Tensor, crop_size: int) -> torch.Tensor:
     cropped = (cropped - mean) * contrast + mean * brightness
     return torch.clamp(cropped, 0.0, 1.0)
 
-# OneHotDistribution Helper
+def set_random_seed(seed: int) -> None:
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+def enable_deterministic_mode() -> None:
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+def count_episode_steps(directory: Any) -> int:
+    from pathlib import Path
+    directory = Path(directory)
+    total = 0
+    for file in directory.glob("*.npz"):
+        try:
+            data = np.load(file)
+            total += len(data["reward"]) - 1
+        except Exception:
+            continue
+    return total
+
+def tensor_to_numpy(tensor):
+    if isinstance(tensor, torch.Tensor):
+        return tensor.detach().cpu().numpy()
+    else:
+        return np.array(tensor)
+
 class OneHotDistribution:
     def __init__(self, logits: torch.Tensor) -> None:
         self.logits = logits
@@ -218,25 +232,64 @@ class OneHotDistribution:
         return torch.nn.functional.one_hot(sample_indices.squeeze(-1),
                                              num_classes=self.logits.shape[-1]).float()
 
-# Updated DistributionWrapper with an entropy method
 class DistributionWrapper:
-    def __init__(self, logits: torch.Tensor) -> None:
+    def __init__(self, logits: torch.Tensor, dist_type: str = "gaussian") -> None:
         self.logits = logits
+        self.dist_type = dist_type
     def log_prob(self, target: torch.Tensor) -> torch.Tensor:
-        if target.dim() == self.logits.dim() - 1:
-            target = target.unsqueeze(-1)
-        return -((self.logits - target) ** 2).mean()
+        if self.dist_type == "gaussian":
+            if target.dim() == self.logits.dim() - 1:
+                target = target.unsqueeze(-1)
+            if self.logits.shape[0] != target.shape[0]:
+                target = target.transpose(0, 1)
+            return -((self.logits - target) ** 2).mean()
+        elif self.dist_type == "symlog_disc":
+            target = target.long().squeeze(-1)
+            logits = self.logits.reshape(-1, self.logits.shape[-1])
+            return -nn.functional.cross_entropy(logits, target.reshape(-1), reduction='mean')
+        elif self.dist_type == "binary":
+            # For binary distributions, assume target values are in [0,1]
+            return -nn.functional.binary_cross_entropy_with_logits(self.logits, target, reduction='mean')
+        else:
+            raise ValueError("Unsupported distribution type")
     def mode(self) -> torch.Tensor:
-        return self.logits
+        if self.dist_type == "gaussian":
+            return self.logits
+        elif self.dist_type == "symlog_disc":
+            mode = torch.argmax(self.logits, dim=-1)
+            return mode.float()
+        elif self.dist_type == "binary":
+            return (self.logits >= 0).float()
+        else:
+            raise ValueError("Unsupported distribution type")
     def sample(self) -> torch.Tensor:
-        noise = torch.randn_like(self.logits) * 0.1
-        return self.logits + noise
+        if self.dist_type == "gaussian":
+            noise = torch.randn_like(self.logits) * 0.1
+            return self.logits + noise
+        elif self.dist_type == "symlog_disc":
+            probs = torch.softmax(self.logits, dim=-1)
+            distribution = torch.distributions.Categorical(probs=probs)
+            return distribution.sample().float()
+        elif self.dist_type == "binary":
+            probs = torch.sigmoid(self.logits)
+            return torch.bernoulli(probs)
+        else:
+            raise ValueError("Unsupported distribution type")
     def entropy(self) -> torch.Tensor:
-        sigma = 0.1
-        entropy_value = 0.5 * torch.log(torch.tensor(2 * torch.pi * torch.e * (sigma ** 2)))
-        return torch.full_like(self.logits, entropy_value)
+        if self.dist_type == "gaussian":
+            sigma = 0.1
+            entropy_value = 0.5 * math.log(2 * math.pi * math.e * (sigma ** 2))
+            return torch.full_like(self.logits, entropy_value)
+        elif self.dist_type == "symlog_disc":
+            probs = torch.softmax(self.logits, dim=-1)
+            return torch.distributions.Categorical(probs=probs).entropy()
+        elif self.dist_type == "binary":
+            p = torch.sigmoid(self.logits)
+            entropy = - p * torch.log(p + 1e-8) - (1 - p) * torch.log(1 - p + 1e-8)
+            return entropy
+        else:
+            raise ValueError("Unsupported distribution type")
 
-# RewardEMA for reward normalization
 class RewardEMA:
     def __init__(self, device: Any, alpha: float = 1e-2) -> None:
         self.device = device
@@ -249,6 +302,3 @@ class RewardEMA:
         scale = torch.clamp(ema_values[1] - ema_values[0], min=1.0)
         offset = ema_values[0]
         return offset.detach(), scale.detach()
-
-def tensor_to_numpy(tensor: torch.Tensor) -> np.ndarray:
-    return tensor.detach().cpu().numpy()

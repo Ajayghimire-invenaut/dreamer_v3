@@ -1,12 +1,12 @@
 """
-Main entry point for Dreamer-V3 training.
+Main entry point for Dreamer‑V3 training.
 Loads configuration, sets up the environment, dataset, logger, and agent,
 runs a data collection (prefill) phase if needed, prints intermediate debug metrics,
 and at the end plots the loss history.
 
 Revisions:
-  - Limit training updates per forward call via training_updates_per_forward.
-  - Use a proper imagined rollout (imagine_trajectory) instead of a dummy static_scan_imagine.
+  - Limits training updates per forward call via training_updates_per_forward.
+  - Uses a proper imagined rollout (imagine_trajectory) instead of a dummy static_scan_imagine.
   - Global step is updated based on actual environment steps.
   - Added extra debug prints around environment resets and simulation.
 """
@@ -22,6 +22,7 @@ import ruamel.yaml
 from ruamel.yaml import YAML
 import numpy as np
 
+# Set XDG_RUNTIME_DIR to avoid warnings.
 uid = os.getuid() if hasattr(os, "getuid") else "win"
 os.environ["XDG_RUNTIME_DIR"] = f"/tmp/runtime-{uid}"
 
@@ -83,12 +84,16 @@ def main(args: Any) -> None:
     if not torch.cuda.is_available():
         args.computation_device = "cpu"
 
+    # Create directories.
     log_directory = pathlib.Path(args.log_dir).expanduser()
-    training_episode_directory = pathlib.Path(args.training_episode_dir) if args.training_episode_dir else log_directory / "train_episodes"
-    evaluation_episode_directory = pathlib.Path(args.evaluation_episode_dir) if args.evaluation_episode_dir else log_directory / "eval_episodes"
+    training_episode_directory = (pathlib.Path(args.training_episode_dir)
+                                  if args.training_episode_dir else log_directory / "train_episodes")
+    evaluation_episode_directory = (pathlib.Path(args.evaluation_episode_dir)
+                                    if args.evaluation_episode_dir else log_directory / "eval_episodes")
     for directory in (log_directory, training_episode_directory, evaluation_episode_directory):
         directory.mkdir(parents=True, exist_ok=True)
 
+    # Count existing training steps.
     initial_steps = count_episode_steps(training_episode_directory)
     logger_obj = Logger(log_directory=log_directory, global_step=args.action_repeat * initial_steps)
     print("[DEBUG] Logging to:", log_directory, flush=True)
@@ -99,6 +104,7 @@ def main(args: Any) -> None:
     if args.use_parallel_environments:
         environment_instance = Parallel(environment_instance, strategy="process")
 
+    # Load training episodes; prefill if none are found.
     training_episodes = load_episode_data(str(training_episode_directory), limit=args.maximum_dataset_size)
     if len(training_episodes) == 0:
         print("[DEBUG] No training episodes found. Prefilling dataset with random policy...", flush=True)
@@ -120,6 +126,7 @@ def main(args: Any) -> None:
     agent.to(args.computation_device)
     print("[DEBUG] Agent instantiated.", flush=True)
 
+    # Load checkpoint if available.
     checkpoint_file = log_directory / "checkpoint_latest.pt"
     if checkpoint_file.exists():
         checkpoint = torch.load(checkpoint_file)
@@ -137,6 +144,7 @@ def main(args: Any) -> None:
         print(f"\n[Iteration {iteration}] Current Step: {agent.current_step} / {args.total_training_steps}", flush=True)
         print(f"[DEBUG] Metrics: {metrics}", flush=True)
 
+        # Record losses (if available).
         actor_loss = metrics.get("actor_loss", 0.0)
         kl_loss = metrics.get("kl_loss", 0.0)
         reconstruction_loss = metrics.get("reconstruction_loss", 0.0)
@@ -161,6 +169,7 @@ def main(args: Any) -> None:
             flush=True
         )
 
+        # Periodically evaluate the agent.
         if agent.current_step % args.evaluation_interval_steps == 0:
             print("\n[DEBUG] ===== Evaluating agent =====", flush=True)
             avg_eval_reward = evaluate_agent(agent, environment_instance,
@@ -172,7 +181,7 @@ def main(args: Any) -> None:
             print(f"[DEBUG] [Evaluation] Global step: {agent.current_step} | Elapsed: {elapsed/60:.2f} min\n", flush=True)
 
         print("[DEBUG] [Training] Simulating episode(s) to collect data...", flush=True)
-        # Call simulate_episode and capture the returned state and number of steps.
+        # Simulate an episode to collect new data.
         simulation_state, steps_in_episode = simulate_episode(
             agent, environment_instance, training_episodes,
             str(training_episode_directory), logger_obj,
@@ -183,6 +192,7 @@ def main(args: Any) -> None:
         agent.current_step += steps_in_episode
         logger_obj.global_step = args.action_repeat * agent.current_step
 
+        # Save checkpoint.
         checkpoint_data = {
             "agent_state_dict": agent.state_dict(),
             "optimizer_state": agent.collect_optimizer_states()
@@ -193,6 +203,7 @@ def main(args: Any) -> None:
     total_time = time.time() - start_time
     print(f"\n[DEBUG] Training completed in {total_time:.2f} seconds over {iteration} iterations.", flush=True)
 
+    # Plot training loss history.
     plt.figure(figsize=(10, 5))
     plt.plot(actor_loss_history, label="Actor Loss")
     plt.plot(kl_loss_history, label="KL Loss")
@@ -211,7 +222,7 @@ def main(args: Any) -> None:
         print(f"[DEBUG] Error closing environment: {e}", flush=True)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Dreamer-V3 Training for Single Environment")
+    parser = argparse.ArgumentParser(description="Dreamer‑V3 Training for Single Environment")
     parser.add_argument("--log_dir", type=str, default="logs", help="Directory for logs and checkpoints.")
     parser.add_argument("--training_episode_dir", type=str, default="", help="Directory for training episodes.")
     parser.add_argument("--evaluation_episode_dir", type=str, default="", help="Directory for evaluation episodes.")
@@ -232,6 +243,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    # Load YAML configuration.
     yaml_loader = YAML(typ='safe', pure=True)
     config_file_path = pathlib.Path(__file__).parent / "config" / "configuration.yaml"
     with config_file_path.open("r") as config_file:

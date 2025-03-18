@@ -9,10 +9,16 @@ It also uses RewardObjective to compute an intrinsic reward with a running basel
 import torch
 import torch.nn as nn
 from typing import Any, Dict, Tuple
-from utils.helper_functions import (imagine_trajectory, lambda_return_target, compute_actor_loss, tensor_stats,
-                                    RewardObjective)
+from utils.helper_functions import (
+    imagine_trajectory, 
+    lambda_return_target, 
+    compute_actor_loss, 
+    tensor_stats,
+    RewardObjective
+)
 from utils.optimizer import Optimizer
 from agent.networks import MLP
+import copy  # Needed for deep-copying the value network
 
 class ImaginedBehavior(nn.Module):
     def __init__(self, configuration: Any, world_model: Any) -> None:
@@ -22,9 +28,12 @@ class ImaginedBehavior(nn.Module):
         self.world_model = world_model
 
         if configuration.dynamics_use_discrete:
-            feature_dimension = configuration.discrete_latent_num * configuration.discrete_latent_size + configuration.dynamics_deterministic_dimension
+            feature_dimension = (configuration.discrete_latent_num *
+                                 configuration.discrete_latent_size +
+                                 configuration.dynamics_deterministic_dimension)
         else:
-            feature_dimension = configuration.dynamics_stochastic_dimension + configuration.dynamics_deterministic_dimension
+            feature_dimension = (configuration.dynamics_stochastic_dimension +
+                                 configuration.dynamics_deterministic_dimension)
 
         self.actor = MLP(
             input_dim=feature_dimension,
@@ -58,9 +67,12 @@ class ImaginedBehavior(nn.Module):
             name="Value",
             use_orthogonal=configuration.use_orthogonal_initialization
         )
+        # Create a separate slow target network if enabled.
         if configuration.critic["use_slow_target"]:
-            self.slow_value = self.value
+            self.slow_value = copy.deepcopy(self.value)
             self.update_counter = 0
+        else:
+            self.slow_value = None
 
         optimizer_args = dict(weight_decay=configuration.weight_decay_value,
                               opt=configuration.optimizer_type,
@@ -81,7 +93,7 @@ class ImaginedBehavior(nn.Module):
         self._update_slow_target()
         metrics: Dict[str, float] = {}
         with torch.amp.autocast("cuda", enabled=self.use_amp):
-            # Roll out the imagined trajectory.
+            # Roll out the imagined trajectory using the helper function.
             imagined_features, imagined_state, imagined_actions = imagine_trajectory(
                 starting_state,
                 self.configuration.imag_horizon,
@@ -97,10 +109,11 @@ class ImaginedBehavior(nn.Module):
             intrinsic_reward = self.reward_objective(
                 self.world_model.dynamics.get_features(imagined_state),
                 self.world_model
-                # Optionally, pass a ground_truth_reward tensor here.
+                # Optionally, ground_truth_reward can be passed here.
             )
             if getattr(self.configuration, "debug", False):
                 print("[DEBUG ImaginedBehavior] Intrinsic reward shape:", intrinsic_reward.shape)
+            # Ensure 'deter' is in state.
             if "deter" not in imagined_state:
                 if getattr(self.configuration, "debug", False):
                     print("[DEBUG ImaginedBehavior] 'deter' not in imagined_state; creating tensor.", flush=True)
@@ -114,12 +127,17 @@ class ImaginedBehavior(nn.Module):
             full_imagined_features = self.world_model.dynamics.get_features(im_state)
             if getattr(self.configuration, "debug", False):
                 print("[DEBUG ImaginedBehavior] Full imagined features shape:", full_imagined_features.shape)
+            # Compute lambda-return targets. Note: make sure that intrinsic_reward is unsqueezed as needed.
             target, weights, baseline = lambda_return_target(
-                intrinsic_reward, self.value(full_imagined_features).mode(),
-                self.configuration.discount_factor, self.configuration.discount_lambda
+                intrinsic_reward, 
+                self.value(full_imagined_features).mode(),
+                self.configuration.discount_factor, 
+                self.configuration.discount_lambda
             )
             if getattr(self.configuration, "debug", False):
+                # Here target is a list; stacking along dim=1 yields [B, T, 1].
                 print("[DEBUG ImaginedBehavior] Lambda-return target stack shape (full):", torch.stack(target, dim=1).shape)
+            # Compute actor loss; note that compute_actor_loss detaches features.
             actor_loss, loss_metrics = compute_actor_loss(
                 actor=self.actor,
                 features=full_imagined_features,
@@ -137,13 +155,13 @@ class ImaginedBehavior(nn.Module):
             predicted_value = self.value(value_input[:-1].detach())
             if getattr(self.configuration, "debug", False):
                 print("[DEBUG ImaginedBehavior] predicted_value shape:", predicted_value.logits.shape)
-            target_stack = torch.stack(target[:-1], dim=1)
+            target_stack = torch.stack(target[:-1], dim=1)  # shape: [B, T-1, 1]
             if getattr(self.configuration, "debug", False):
                 print("[DEBUG ImaginedBehavior] target_stack shape (trimmed):", target_stack.shape)
             value_loss = -predicted_value.log_prob(target_stack.detach())
             if getattr(self.configuration, "debug", False):
                 print("[DEBUG ImaginedBehavior] value_loss shape after log_prob:", value_loss.shape)
-            if self.configuration.critic["use_slow_target"]:
+            if self.configuration.critic.get("use_slow_target", False) and self.slow_value is not None:
                 slow_target_output = self.slow_value(value_input[:-1].detach())
                 value_loss = value_loss - predicted_value.log_prob(slow_target_output.mode().detach())
             value_loss = torch.mean(weights[:-1] * value_loss)
@@ -157,7 +175,7 @@ class ImaginedBehavior(nn.Module):
         return imagined_features, imagined_state, imagined_actions, weights, metrics
 
     def _update_slow_target(self) -> None:
-        if self.configuration.critic["use_slow_target"]:
+        if self.configuration.critic.get("use_slow_target", False) and self.slow_value is not None:
             if self.update_counter % self.configuration.critic["slow_target_update_interval"] == 0:
                 mix_fraction = self.configuration.critic["slow_target_update_fraction"]
                 for fast_param, slow_param in zip(self.value.parameters(), self.slow_value.parameters()):

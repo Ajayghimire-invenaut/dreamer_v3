@@ -1,4 +1,3 @@
-import torch
 import time
 import collections
 import io
@@ -22,31 +21,32 @@ class EpisodeDataset(IterableDataset):
         self.max_samples = max_samples
 
     def __iter__(self):
-      count = 0
-      while count < self.max_samples:
-          episode = self.rng.choice(self.episodes)
-          total_length = len(next(iter(episode.values())))
-          # If the episode is too short, pad it.
-          segment = {}
-          for key, value in episode.items():
-              arr = np.array(value)
-              if arr.shape[0] < self.sequence_length:
-                  pad_length = self.sequence_length - arr.shape[0]
-                  # Use the last value as the pad; modify if needed.
-                  pad_value = arr[-1]
-                  pad_array = np.full((pad_length,) + arr.shape[1:], pad_value)
-                  seg = np.concatenate([arr, pad_array], axis=0)
-              else:
-                  start_index = self.rng.integers(0, total_length - self.sequence_length + 1)
-                  seg = arr[start_index:start_index + self.sequence_length]
-              segment[key] = seg
-          # Mark the first time step as a reset.
-          if "is_first" in segment:
-              segment["is_first"][0] = True
-          print(f"[Dataset Debug] Yielding segment {count}: keys={list(segment.keys())}, action shape={segment.get('action', 'N/A').shape}", flush=True)
-          yield segment
-          count += 1
-
+        count = 0
+        while count < self.max_samples:
+            # Randomly choose an episode
+            episode = self.rng.choice(self.episodes)
+            total_length = len(next(iter(episode.values())))
+            segment = {}
+            # For each key in the episode, sample a segment of the desired length.
+            for key, value in episode.items():
+                arr = np.array(value)
+                if arr.shape[0] < self.sequence_length:
+                    # Pad the episode if too short (using last value for padding)
+                    pad_length = self.sequence_length - arr.shape[0]
+                    pad_value = arr[-1]
+                    pad_array = np.full((pad_length,) + arr.shape[1:], pad_value)
+                    seg = np.concatenate([arr, pad_array], axis=0)
+                else:
+                    start_index = self.rng.integers(0, total_length - self.sequence_length + 1)
+                    seg = arr[start_index:start_index + self.sequence_length]
+                segment[key] = seg
+            # Ensure the first time step is marked as a reset.
+            if "is_first" in segment:
+                segment["is_first"][0] = True
+            # Debug print the keys and the shape of the 'action' segment (if available)
+            print(f"[Dataset Debug] Yielding segment {count}: keys={list(segment.keys())}, action shape={segment.get('action', 'N/A').shape}", flush=True)
+            yield segment
+            count += 1
 
 def create_dataset(episodes: Dict[str, Any], configuration: Any) -> Generator[Dict[str, Any], None, None]:
     """
@@ -59,10 +59,15 @@ def create_dataset(episodes: Dict[str, Any], configuration: Any) -> Generator[Di
         seed=configuration.random_seed,
         max_samples=10000  # Adjust if needed.
     )
+    # The DataLoader collates episodes along the batch dimension (axis 0).
     dataloader = DataLoader(dataset, batch_size=configuration.batch_size)
     return iter(dataloader)
 
 def from_generator(generator: Generator[Dict[str, Any], None, None], batch_size: int) -> Generator[Dict[str, Any], None, None]:
+    """
+    Continuously collects batch_size samples from the generator and collates them.
+    Each key is stacked along axis 0, so the batch dimension is first.
+    """
     while True:
         batch = [next(generator) for _ in range(batch_size)]
         data: Dict[str, Any] = {}
@@ -73,7 +78,7 @@ def from_generator(generator: Generator[Dict[str, Any], None, None], batch_size:
 
 def sample_episodes(episodes: Dict[str, Any], sequence_length: int, seed: int = 0) -> Generator[Dict[str, Any], None, None]:
     """
-    Legacy infinite generator (use create_dataset for new code).
+    Legacy infinite generator. Use create_dataset for new code.
     """
     np_random = np.random.RandomState(seed)
     if len(episodes) == 0:
@@ -91,6 +96,7 @@ def sample_episodes(episodes: Dict[str, Any], sequence_length: int, seed: int = 
         segment = {}
         for key, value in episode.items():
             seg = np.array(value[start_index:start_index + sequence_length])
+            # If the 'action' key is one timestep short, pad it.
             if key == "action" and seg.shape[0] == sequence_length - 1:
                 pad_value = seg[-1] if seg.shape[0] > 0 else 0
                 seg = np.concatenate([seg, np.array([pad_value])], axis=0)
@@ -100,6 +106,10 @@ def sample_episodes(episodes: Dict[str, Any], sequence_length: int, seed: int = 
         yield segment
 
 def load_episode_data(directory: str, limit: Any = None, reverse: bool = True) -> Dict[str, Any]:
+    """
+    Loads episode data from .npz files in the given directory.
+    Only episodes containing the required keys are loaded.
+    """
     directory_path = pathlib.Path(directory).expanduser()
     episodes: Dict[str, Any] = collections.OrderedDict()
     total_steps = 0
@@ -156,6 +166,7 @@ def simulate_episode(agent_or_policy: Any,
         action, agent_state = agent_or_policy(observation, [done_flag], agent_state)
         act = action["action"]
         if isinstance(act, torch.Tensor):
+            # If action is a vector (e.g. one-hot), take argmax; otherwise assume scalar.
             if act.dim() == 2 and act.size(1) > 1:
                 act = int(torch.argmax(act, dim=-1).item())
             else:

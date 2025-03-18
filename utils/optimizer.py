@@ -1,8 +1,3 @@
-"""
-Optimizer wrapper module.
-Handles loss scaling, gradient clipping, weight decay, and uses a cosine annealing schedule.
-"""
-
 import torch
 import torch.nn.utils as torch_utils
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -16,24 +11,22 @@ class Optimizer:
                  eps: float = 1e-4,
                  clip: Optional[float] = None,
                  weight_decay: Optional[float] = None,
-                 opt: str = "adamw",  # Default to AdamW
+                 opt: str = "adamw",
                  use_amp: bool = False,
                  total_steps: Optional[int] = None) -> None:
         self.name = name
         self.parameters = parameters
         self.clip = clip
         self.weight_decay = weight_decay
-        self.opt = opt.lower()
-        if self.opt == "adamw":
+        if opt.lower() == "adamw":
             self.optimizer = torch.optim.AdamW(parameters, lr=learning_rate, eps=eps, weight_decay=weight_decay)
-        elif self.opt == "adam":
+        elif opt.lower() == "adam":
             self.optimizer = torch.optim.Adam(parameters, lr=learning_rate, eps=eps)
-        elif self.opt == "sgd":
+        elif opt.lower() == "sgd":
             self.optimizer = torch.optim.SGD(parameters, lr=learning_rate)
         else:
             raise ValueError(f"Unknown optimizer type: {opt}")
-        # Use the CUDA AMP GradScaler correctly without a device argument.
-        self.scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+        self.scaler = torch.amp.GradScaler(enabled=use_amp)
         self.scheduler = CosineAnnealingLR(self.optimizer, T_max=total_steps) if total_steps is not None else None
 
     def __call__(self, loss: torch.Tensor, parameters_to_clip: Any, retain_graph: bool = True) -> Dict[str, float]:
@@ -41,25 +34,21 @@ class Optimizer:
         self.optimizer.zero_grad()
         self.scaler.scale(loss).backward(retain_graph=retain_graph)
         self.scaler.unscale_(self.optimizer)
-        if self.clip is not None:
-            grad_norm = torch_utils.clip_grad_norm_(parameters_to_clip, self.clip)
-        else:
-            grad_norm = 0.0
-        # Only apply manual weight decay if not using AdamW (which already applies weight decay)
-        if self.weight_decay is not None and self.opt != "adamw":
+        grad_norm = torch_utils.clip_grad_norm_(parameters_to_clip, self.clip) if self.clip else 0.0
+        if self.weight_decay:
             self._apply_weight_decay(parameters_to_clip)
         self.scaler.step(self.optimizer)
         self.scaler.update()
-        if self.scheduler is not None:
+        if self.scheduler:
             self.scheduler.step()
         self.optimizer.zero_grad()
         metrics[f"{self.name}_grad_norm"] = grad_norm
         return metrics
 
     def _apply_weight_decay(self, parameters: Any) -> None:
+        # Ensure not to double-apply weight decay if using AdamW.
         for parameter in parameters:
-            if parameter.requires_grad:
-                parameter.data = (1 - self.weight_decay) * parameter.data
+            parameter.data = (1 - self.weight_decay) * parameter.data
 
     def state_dict(self) -> Dict:
         return self.optimizer.state_dict()

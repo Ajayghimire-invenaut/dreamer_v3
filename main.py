@@ -2,13 +2,15 @@
 Main entry point for Dreamer‑V3 training.
 Loads configuration, sets up the environment, dataset, logger, and agent,
 runs a data collection (prefill) phase if needed, prints intermediate debug metrics,
-and at the end plots the loss history.
+and finally plots the loss history.
 
 Revisions:
-  - Limits training updates per forward call via training_updates_per_forward.
-  - Uses a proper imagined rollout (imagine_trajectory) instead of a dummy static_scan_imagine.
+  - Limits training updates per forward call.
+  - Uses a proper imagined rollout.
   - Global step is updated based on actual environment steps.
-  - Added extra debug prints around environment resets and simulation.
+  - Extra debug prints around environment resets and simulation.
+  - Consistent tensor dimension ordering (dynamics module expects time-first).
+  - Uses symlog transformation utilities (if using symlog_disc) in DistributionWrapper.
 """
 
 import os
@@ -39,15 +41,15 @@ kl_loss_history = []
 reconstruction_loss_history = []
 exploration_loss_history = []
 
-def prefill_dataset(environment: SingleEnvironment, save_directory: str, logger_obj: Logger, num_episodes: int, args: Any) -> None:
+def prefill_dataset(env: SingleEnvironment, save_dir: str, logger_obj: Logger, num_episodes: int, args: Any) -> None:
     """
     Prefill dataset using a random policy.
     """
     from agent.random_explorer import RandomExplorer
-    random_policy = RandomExplorer(args, environment.action_space)
+    random_policy = RandomExplorer(args, env.action_space)
     for ep in range(num_episodes):
         print(f"[DEBUG] Prefilling: Collecting prefill episode {ep+1}/{num_episodes}", flush=True)
-        simulate_episode(random_policy, environment, {}, save_directory, logger_obj, episodes_num=1)
+        simulate_episode(random_policy, env, {}, save_dir, logger_obj, episodes_num=1)
 
 def evaluate_agent(agent: DreamerAgent, env: SingleEnvironment, num_episodes: int = 5, render: bool = False) -> float:
     """
@@ -57,8 +59,7 @@ def evaluate_agent(agent: DreamerAgent, env: SingleEnvironment, num_episodes: in
     for ep in range(num_episodes):
         obs = env.reset()
         print(f"[DEBUG] Evaluation: Reset observation shape: {np.array(obs['image']).shape}", flush=True)
-        img = obs["image"]
-        print(f"[DEBUG] Evaluation observation: mean = {np.mean(img):.2f}, std = {np.std(img):.2f}", flush=True)
+        print(f"[DEBUG] Evaluation observation: mean = {np.mean(obs['image']):.2f}, std = {np.std(obs['image']):.2f}", flush=True)
         done = False
         ep_reward = 0.0
         while not done:
@@ -85,40 +86,38 @@ def main(args: Any) -> None:
         args.computation_device = "cpu"
 
     # Create directories.
-    log_directory = pathlib.Path(args.log_dir).expanduser()
-    training_episode_directory = (pathlib.Path(args.training_episode_dir)
-                                  if args.training_episode_dir else log_directory / "train_episodes")
-    evaluation_episode_directory = (pathlib.Path(args.evaluation_episode_dir)
-                                    if args.evaluation_episode_dir else log_directory / "eval_episodes")
-    for directory in (log_directory, training_episode_directory, evaluation_episode_directory):
+    log_dir = pathlib.Path(args.log_dir).expanduser()
+    train_ep_dir = pathlib.Path(args.training_episode_dir) if args.training_episode_dir else log_dir / "train_episodes"
+    eval_ep_dir = pathlib.Path(args.evaluation_episode_dir) if args.evaluation_episode_dir else log_dir / "eval_episodes"
+    for directory in (log_dir, train_ep_dir, eval_ep_dir):
         directory.mkdir(parents=True, exist_ok=True)
 
     # Count existing training steps.
-    initial_steps = count_episode_steps(training_episode_directory)
-    logger_obj = Logger(log_directory=log_directory, global_step=args.action_repeat * initial_steps)
-    print("[DEBUG] Logging to:", log_directory, flush=True)
+    initial_steps = count_episode_steps(train_ep_dir)
+    logger_obj = Logger(log_directory=log_dir, global_step=args.action_repeat * initial_steps)
+    print("[DEBUG] Logging to:", log_dir, flush=True)
 
     # Create environment.
-    environment_instance = SingleEnvironment(task_name=args.task_name, action_repeat=args.action_repeat, seed=args.random_seed)
-    print("[DEBUG] Created environment:", environment_instance.identifier, flush=True)
+    env_instance = SingleEnvironment(task_name=args.task_name, action_repeat=args.action_repeat, seed=args.random_seed)
+    print("[DEBUG] Created environment:", env_instance.identifier, flush=True)
     if args.use_parallel_environments:
-        environment_instance = Parallel(environment_instance, strategy="process")
+        env_instance = Parallel(env_instance, strategy="process")
 
-    # Load training episodes; prefill if none are found.
-    training_episodes = load_episode_data(str(training_episode_directory), limit=args.maximum_dataset_size)
+    # Load training episodes; prefill if none found.
+    training_episodes = load_episode_data(str(train_ep_dir), limit=args.maximum_dataset_size)
     if len(training_episodes) == 0:
-        print("[DEBUG] No training episodes found. Prefilling dataset with random policy...", flush=True)
-        prefill_dataset(environment_instance, str(training_episode_directory), logger_obj, num_episodes=10, args=args)
-        training_episodes = load_episode_data(str(training_episode_directory), limit=args.maximum_dataset_size)
+        print("[DEBUG] No training episodes found. Prefilling dataset...", flush=True)
+        prefill_dataset(env_instance, str(train_ep_dir), logger_obj, num_episodes=10, args=args)
+        training_episodes = load_episode_data(str(train_ep_dir), limit=args.maximum_dataset_size)
 
-    evaluation_episodes = load_episode_data(str(evaluation_episode_directory), limit=1)
+    evaluation_episodes = load_episode_data(str(eval_ep_dir), limit=1)
     training_dataset = create_dataset(training_episodes, args)
     evaluation_dataset = create_dataset(evaluation_episodes, args)
 
     # Instantiate agent.
     agent = DreamerAgent(
-        environment_instance.observation_space,
-        environment_instance.action_space,
+        env_instance.observation_space,
+        env_instance.action_space,
         args,
         logger_obj,
         training_dataset
@@ -127,7 +126,7 @@ def main(args: Any) -> None:
     print("[DEBUG] Agent instantiated.", flush=True)
 
     # Load checkpoint if available.
-    checkpoint_file = log_directory / "checkpoint_latest.pt"
+    checkpoint_file = log_dir / "checkpoint_latest.pt"
     if checkpoint_file.exists():
         checkpoint = torch.load(checkpoint_file)
         agent.load_state_dict(checkpoint["agent_state_dict"])
@@ -164,15 +163,12 @@ def main(args: Any) -> None:
             except Exception as e:
                 print(f"[DEBUG] Error logging {metric_name}: {e}", flush=True)
 
-        print(
-            f"[DEBUG] Actor Loss: {actor_loss:.4f}, KL Loss: {kl_loss:.4f}, Reconstruction Loss: {reconstruction_loss:.4f}, Exploration Loss: {exploration_loss:.4f}",
-            flush=True
-        )
+        print(f"[DEBUG] Actor Loss: {actor_loss:.4f}, KL Loss: {kl_loss:.4f}, Reconstruction Loss: {reconstruction_loss:.4f}, Exploration Loss: {exploration_loss:.4f}", flush=True)
 
         # Periodically evaluate the agent.
         if agent.current_step % args.evaluation_interval_steps == 0:
             print("\n[DEBUG] ===== Evaluating agent =====", flush=True)
-            avg_eval_reward = evaluate_agent(agent, environment_instance,
+            avg_eval_reward = evaluate_agent(agent, env_instance,
                                              num_episodes=args.evaluation_number_of_episodes,
                                              render=False)
             logger_obj.scalar("evaluation/average_reward", avg_eval_reward)
@@ -181,10 +177,9 @@ def main(args: Any) -> None:
             print(f"[DEBUG] [Evaluation] Global step: {agent.current_step} | Elapsed: {elapsed/60:.2f} min\n", flush=True)
 
         print("[DEBUG] [Training] Simulating episode(s) to collect data...", flush=True)
-        # Simulate an episode to collect new data.
         simulation_state, steps_in_episode = simulate_episode(
-            agent, environment_instance, training_episodes,
-            str(training_episode_directory), logger_obj,
+            agent, env_instance, training_episodes,
+            str(train_ep_dir), logger_obj,
             steps=args.evaluation_interval_steps,
             state=simulation_state
         )
@@ -217,7 +212,7 @@ def main(args: Any) -> None:
     plt.show()
 
     try:
-        environment_instance.close()
+        env_instance.close()
     except Exception as e:
         print(f"[DEBUG] Error closing environment: {e}", flush=True)
 

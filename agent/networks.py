@@ -1,13 +1,41 @@
 """
-Neural network modules for Dreamer-V3.
+Neural network modules for Dreamer‑V3.
 Includes MultiEncoder, RSSM, MultiDecoder, MLP, and DistributionWrapper.
+Also includes symlog transformation utilities.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Any, Dict, List, Optional, Tuple
-import math  # Needed for entropy calculation
+import math
+
+# ---------- Symlog Transformation Utilities ----------
+
+def symlog(x: torch.Tensor) -> torch.Tensor:
+    return torch.sign(x) * torch.log1p(torch.abs(x))
+
+def inv_symlog(y: torch.Tensor) -> torch.Tensor:
+    return torch.sign(y) * (torch.expm1(torch.abs(y)))
+
+def discretize_symlog(x: torch.Tensor, num_bins: int = 255, low: float = -10.0, high: float = 10.0) -> torch.Tensor:
+    """
+    Applies symlog to x, then discretizes to integer bins.
+    Assumes x is in a scale where most values lie between low and high.
+    """
+    y = symlog(x)
+    y_clamped = torch.clamp(y, low, high)
+    bins = ((y_clamped - low) / (high - low) * (num_bins - 1)).long()
+    return bins
+
+def undisc_symlog(bins: torch.Tensor, num_bins: int = 255, low: float = -10.0, high: float = 10.0) -> torch.Tensor:
+    """
+    Converts discretized symlog bin indices back to a real value.
+    """
+    y = bins.float() / (num_bins - 1) * (high - low) + low
+    return inv_symlog(y)
+
+# ---------- Orthogonal Initialization ----------
 
 def orthogonal_initialize(module: nn.Module, gain: Optional[float] = None) -> None:
     if gain is None:
@@ -17,7 +45,8 @@ def orthogonal_initialize(module: nn.Module, gain: Optional[float] = None) -> No
         if module.bias is not None:
             nn.init.constant_(module.bias, 0)
 
-# ---------------------- MultiEncoder ----------------------
+# ---------- MultiEncoder ----------
+
 class MultiEncoder(nn.Module):
     def __init__(self,
                  input_shapes: Dict[str, Tuple[int, ...]],
@@ -37,7 +66,7 @@ class MultiEncoder(nn.Module):
                 nn.Conv2d(in_channels=128, out_channels=256, kernel_size=4, stride=2),
                 nn.ReLU()
             )
-            # Expected output shape: (256, 2, 2) → flattened = 256*2*2 = 1024.
+            # Expected output: (256, 2, 2) → flattened = 256*2*2 = 1024.
             self.fc = nn.Linear(256 * 2 * 2, output_dimension)
             if use_orthogonal:
                 self.convolutional_layers.apply(orthogonal_initialize)
@@ -58,17 +87,17 @@ class MultiEncoder(nn.Module):
             image = observations["image"]
             if getattr(observations, "debug", False):
                 print("[DEBUG MultiEncoder] received image shape:", image.shape, flush=True)
-            # If image is given as a sequence: [B, T, H, W, C]
+            # If image is a sequence [B, T, H, W, C]
             if image.dim() == 5:
                 if image.shape[-1] in [1, 3]:
-                    image = image.permute(0, 1, 4, 2, 3)
+                    image = image.permute(0, 1, 4, 2, 3)  # [B, T, C, H, W]
                     print("[DEBUG MultiEncoder] permuted 5D image shape:", image.shape, flush=True)
                 B, T, C, H, W = image.shape
-                image = image.view(B * T, C, H, W)
+                image = image.reshape(B * T, C, H, W)
                 features = self.convolutional_layers(image)
-                flattened = features.view(features.size(0), -1)
+                flattened = features.reshape(features.size(0), -1)
                 out = self.fc(flattened)
-                out = out.view(B, T, -1)
+                out = out.reshape(B, T, -1)
                 print("[DEBUG MultiEncoder] output shape (batched sequence):", out.shape, flush=True)
                 return out
             elif image.dim() == 3:
@@ -78,14 +107,15 @@ class MultiEncoder(nn.Module):
             elif image.dim() == 4 and image.shape[-1] in [1, 3]:
                 image = image.permute(0, 3, 1, 2)
             features = self.convolutional_layers(image)
-            flattened = features.view(features.size(0), -1)
+            flattened = features.reshape(features.size(0), -1)
             out = self.fc(flattened)
             print("[DEBUG MultiEncoder] output shape (batched):", out.shape, flush=True)
             return out
         else:
             return self.fc(observations["image"])
 
-# ---------------------- RSSM ----------------------
+# ---------- RSSM (Recurrent State-Space Model) ----------
+
 class RSSM(nn.Module):
     def __init__(self,
                  stoch_dimension: int,
@@ -136,19 +166,18 @@ class RSSM(nn.Module):
                 embeddings: torch.Tensor,
                 actions: torch.Tensor,
                 is_first: torch.Tensor) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-        # Expect embeddings: [B, T, embed_dim] and actions: [B, T, action_dim]
-        # Permute to time-first: [T, B, ...]
-        embeddings = embeddings.permute(1, 0, -1)
-        actions = actions.permute(1, 0, -1)
-        combined = torch.cat([embeddings, actions], dim=-1)
-        outputs, _ = self.gru(combined)  # outputs: [T, B, deter_dimension]
+        # embeddings: [B, T, embed_dim], actions: [B, T, action_dim] -> transpose to time-first.
+        embeddings = embeddings.transpose(0, 1)  # now [T, B, embed_dim]
+        actions = actions.transpose(0, 1)        # now [T, B, action_dim]
+        combined = torch.cat([embeddings, actions], dim=-1)  # [T, B, embed_dim+action_dim]
+        outputs, _ = self.gru(combined)  # [T, B, deter_dimension]
         deter = outputs
         if self.use_discrete:
             logits = self.logits_layer(outputs)  # [T, B, discrete_latent_num*discrete_latent_size]
             T, B, _ = logits.shape
-            logits = logits.view(T, B, self.discrete_latent_num, self.discrete_latent_size)
+            logits = logits.reshape(T, B, self.discrete_latent_num, self.discrete_latent_size)
             posterior = {"deter": deter, "logits": logits}
-            prior = posterior  # In a full implementation, prior is computed separately.
+            prior = posterior  # In full implementation, prior may differ.
         else:
             mean = self.mean_layer(outputs)
             std = F.softplus(self.std_layer(outputs)) + self.minimum_std
@@ -161,35 +190,31 @@ class RSSM(nn.Module):
                      previous_action: Optional[torch.Tensor],
                      embedding: torch.Tensor,
                      is_first: torch.Tensor) -> Tuple[Dict[str, torch.Tensor], None]:
-        # For single-step update, expect embedding: [B, embed_dim]. If extra time dim exists, squeeze it.
-        if embedding.dim() == 3 and embedding.size(1) == 1:
-            embedding = embedding.squeeze(1)
-            print("[DEBUG observe_step] Squeezed embedding to shape:", embedding.shape, flush=True)
-        # Process previous_action
+        # Expect embedding: [B, embed_dim]. If it has an extra time dimension, select last time step.
+        if embedding.dim() == 3:
+            if embedding.size(1) != 1:
+                embedding = embedding[:, -1, :]
+            else:
+                embedding = embedding.squeeze(1)
+            print("[DEBUG observe_step] Processed embedding shape:", embedding.shape, flush=True)
+        # Process previous_action to shape [B, action_dim].
         if previous_action is not None and previous_action.dim() == 3:
-            print(f"[DEBUG observe_step] previous_action before squeezing: {previous_action.shape}", flush=True)
             previous_action = previous_action[:, -1, :]
-            print(f"[DEBUG observe_step] previous_action after squeezing: {previous_action.shape}", flush=True)
         elif previous_action is None:
             previous_action = torch.zeros(embedding.size(0), self.number_of_actions, device=embedding.device)
         elif previous_action.dim() == 1:
-            previous_action = torch.nn.functional.one_hot(previous_action.long(), num_classes=self.number_of_actions).float()
+            previous_action = F.one_hot(previous_action.long(), num_classes=self.number_of_actions).float()
         elif previous_action.dim() < 2:
             previous_action = previous_action.unsqueeze(0)
-            previous_action = torch.nn.functional.one_hot(previous_action.long(), num_classes=self.number_of_actions).float()
-
-        print(f"[DEBUG observe_step] embedding shape: {embedding.shape}, previous_action shape: {previous_action.shape}", flush=True)
-        combined = torch.cat([embedding, previous_action], dim=-1)  # [B, embed_dim + action_dim]
-        print(f"[DEBUG observe_step] combined shape before unsqueeze: {combined.shape}", flush=True)
-        # For single-step, unsqueeze at dim=0 (time dimension)
-        combined = combined.unsqueeze(0)  # [1, B, D+A]
-        print(f"[DEBUG observe_step] combined shape after unsqueeze: {combined.shape}", flush=True)
+            previous_action = F.one_hot(previous_action.long(), num_classes=self.number_of_actions).float()
+        combined = torch.cat([embedding, previous_action], dim=-1)  # [B, embed_dim+action_dim]
+        combined = combined.unsqueeze(0)  # add time dimension: [1, B, D]
         output, _ = self.gru(combined)  # [1, B, deter_dimension]
-        deter = output.squeeze(0)  # [B, deter_dimension]
+        deter = output.squeeze(0)       # [B, deter_dimension]
         if self.use_discrete:
             logits = self.logits_layer(deter)
             B = logits.shape[0]
-            logits = logits.view(B, self.discrete_latent_num, self.discrete_latent_size)
+            logits = logits.reshape(B, self.discrete_latent_num, self.discrete_latent_size)
             new_state = {"deter": deter, "logits": logits}
         else:
             mean = self.mean_layer(deter)
@@ -198,41 +223,78 @@ class RSSM(nn.Module):
         return new_state, None
 
     def get_features(self, state: Dict[str, torch.Tensor]) -> torch.Tensor:
+        # We want batch-first features: [B, T, feature_dim]
         if self.use_discrete:
+            # state["logits"] is expected to be time-first: [T, B, dnum, dsize]
             probs = torch.softmax(state["logits"], dim=-1)
             print(f"[DEBUG get_features] raw probs shape: {probs.shape}", flush=True)
             if probs.ndim == 4:
-                B, T, dnum, dsize = probs.shape
-                try:
-                    probs_flat = probs.view(B, T, -1)
-                    print(f"[DEBUG get_features] probs_flat shape: {probs_flat.shape}", flush=True)
-                except Exception as e:
-                    print("[ERROR get_features] Cannot reshape probs:", e, flush=True)
-                    raise
+                T, B, dnum, dsize = probs.shape
+                probs_flat = probs.reshape(B, T, -1)  # [B, T, dnum*dsize]
             elif probs.ndim == 3:
                 probs = probs.unsqueeze(1)
-                probs_flat = probs.view(probs.shape[0], 1, -1)
-                print(f"[DEBUG get_features] Added time dimension, probs_flat shape: {probs_flat.shape}", flush=True)
+                probs_flat = probs.reshape(probs.shape[0], 1, -1)
             else:
                 probs_flat = probs
             deter = state["deter"]
-            if deter.ndim == 2:
-                deter = deter.unsqueeze(1)
-                print(f"[DEBUG get_features] Expanded 'deter' to shape: {deter.shape}", flush=True)
+            if deter.dim() == 3:  # assume [T, B, deter_dim]
+                deter = deter.transpose(0, 1)  # now [B, T, deter_dim]
+            elif deter.dim() == 2:
+                # Already batch-first
+                pass
             if deter.shape[1] != probs_flat.shape[1]:
                 if deter.shape[1] == 1:
                     deter = deter.expand(deter.shape[0], probs_flat.shape[1], deter.shape[2])
-                    print(f"[DEBUG get_features] Broadcasted 'deter' to shape: {deter.shape}", flush=True)
                 elif probs_flat.shape[1] == 1:
                     probs_flat = probs_flat.expand(probs_flat.shape[0], deter.shape[1], probs_flat.shape[2])
-                    print(f"[DEBUG get_features] Broadcasted 'probs_flat' to shape: {probs_flat.shape}", flush=True)
-            features = torch.cat([deter, probs_flat], dim=-1)
+            features = torch.cat([deter, probs_flat], dim=-1)  # [B, T, feature_dim]
             print(f"[DEBUG get_features] features shape: {features.shape}", flush=True)
             return features
-        if "deter" not in state:
-            print("Warning: 'deter' not in state. Keys present:", state.keys(), flush=True)
-            return state["mean"]
-        return torch.cat([state["deter"], state["mean"]], dim=-1)
+        else:
+            # For continuous, ensure outputs are batch-first.
+            deter = state["deter"]
+            if deter.dim() == 3:
+                deter = deter.transpose(0, 1)
+            if "mean" in state:
+                mean = state["mean"]
+                if mean.dim() == 3:
+                    mean = mean.transpose(0, 1)
+                return torch.cat([deter, mean], dim=-1)
+            else:
+                return deter
+
+    def imagine_with_action(self,
+                            actions: torch.Tensor,
+                            initial_state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        # Assume actions are batch-first: [B, H, ...]. Repeat initial_state along time dim.
+        horizon = actions.shape[1]
+        repeated_state = {}
+        for key in initial_state:
+            repeated_state[key] = initial_state[key].unsqueeze(1).repeat(1, horizon, 1)
+        return repeated_state
+
+    def compute_kl_loss(self,
+                        posterior: Dict[str, torch.Tensor],
+                        prior: Dict[str, torch.Tensor],
+                        kl_free: float,
+                        dynamics_scale: float,
+                        representation_scale: float) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.use_discrete:
+            post_logits = posterior["logits"]
+            prior_logits = prior["logits"]
+            post = torch.softmax(post_logits, dim=-1)
+            prior = torch.softmax(prior_logits, dim=-1)
+            kl = post * (torch.log(post + 1e-8) - torch.log(prior + 1e-8))
+            kl = kl.sum(dim=-1).mean()
+        else:
+            mean_diff = posterior["mean"] - prior["mean"]
+            var_ratio = (posterior["std"] / prior["std"])**2
+            kl = 0.5 * (var_ratio + (mean_diff**2) / (prior["std"]**2) - 1 - torch.log(var_ratio + 1e-8))
+            kl = kl.mean()
+        kl_loss = torch.clamp(kl, min=kl_free)
+        return kl_loss, kl, dynamics_scale, representation_scale
+
+# ---------- MultiDecoder ----------
 
 class MultiDecoder(nn.Module):
     def __init__(self,
@@ -281,35 +343,27 @@ class MultiDecoder(nn.Module):
         if self.decoder_type == "conv":
             if features.dim() == 3:
                 B, T, D = features.shape
-                if self.debug:
-                    print("[DEBUG MultiDecoder] conv branch input features shape (B, T, D):", features.shape, flush=True)
-                features = features.view(B * T, D)
+                features = features.reshape(B * T, D)
                 x = self.fc(features)
-                if self.debug:
-                    print("[DEBUG MultiDecoder] after fc shape:", x.shape, flush=True)
-                x = x.view(B * T, 256, 4, 4)
-                if self.debug:
-                    print("[DEBUG MultiDecoder] reshaped to:", x.shape, flush=True)
+                x = x.reshape(B * T, 256, 4, 4)
                 reconstruction = self.deconv_layers(x)
-                if self.debug:
-                    print("[DEBUG MultiDecoder] after deconv shape:", reconstruction.shape, flush=True)
-                reconstruction = reconstruction.view(B, T, *reconstruction.shape[1:])
-                if self.debug:
-                    print("[DEBUG MultiDecoder] final reconstruction shape:", reconstruction.shape, flush=True)
+                reconstruction = reconstruction.reshape(B, T, *reconstruction.shape[1:])
             else:
                 x = self.fc(features)
-                x = x.view(features.size(0), 256, 4, 4)
+                x = x.reshape(features.size(0), 256, 4, 4)
                 reconstruction = self.deconv_layers(x)
-            return {"image": DistributionWrapper(reconstruction)}
+            return {"image": DistributionWrapper(reconstruction, dist_type="gaussian")}
         else:
             if features.dim() == 3:
                 B, T, D = features.shape
-                features = features.view(B * T, D)
+                features = features.reshape(B * T, D)
                 out = self.decoder(features)
-                out = out.view(B, T, *self.output_shape)
+                out = out.reshape(B, T, *self.output_shape)
             else:
                 out = self.decoder(features)
-            return {"image": DistributionWrapper(out)}
+            return {"image": DistributionWrapper(out, dist_type="gaussian")}
+
+# ---------- MLP ----------
 
 class MLP(nn.Module):
     def __init__(self,
@@ -345,8 +399,17 @@ class MLP(nn.Module):
         self.outscale = outscale
 
     def forward(self, x: torch.Tensor) -> Any:
-        output = self.network(x)
+        orig_shape = x.shape
+        if x.dim() > 2:
+            x = x.reshape(-1, x.shape[-1])
+            output = self.network(x)
+            new_shape = list(orig_shape[:-1]) + [output.shape[-1]]
+            output = output.reshape(new_shape)
+        else:
+            output = self.network(x)
         return DistributionWrapper(output, dist_type=self.distribution_type)
+
+# ---------- DistributionWrapper ----------
 
 class DistributionWrapper:
     def __init__(self, logits: torch.Tensor, dist_type: str = "gaussian") -> None:
@@ -358,15 +421,22 @@ class DistributionWrapper:
         if self.dist_type == "gaussian":
             if target.dim() == self.logits.dim() - 1:
                 target = target.unsqueeze(-1)
+            # Ensure batch and time dims match; if not, transpose target.
             if self.logits.shape[0] != target.shape[0]:
                 target = target.transpose(0, 1)
             return -((self.logits - target) ** 2).mean()
         elif self.dist_type == "symlog_disc":
-            target = target.long().squeeze(-1)
-            logits = self.logits.view(-1, self.logits.shape[-1])
-            return -nn.functional.cross_entropy(logits, target.view(-1), reduction='mean')
+            target_bins = discretize_symlog(target, num_bins=self.logits.shape[-1])
+            target_bins = target_bins.reshape(-1)
+            logits_flat = self.logits.reshape(-1, self.logits.shape[-1])
+            return -nn.functional.cross_entropy(logits_flat, target_bins, reduction='mean')
         elif self.dist_type == "binary":
-            return -nn.functional.binary_cross_entropy_with_logits(self.logits, target, reduction='mean')
+            # Correct for possible transposition between batch and time dims.
+            if self.logits.shape[0] != target.shape[0] and self.logits.shape[0] == target.shape[1] and self.logits.shape[1] == target.shape[0]:
+                corrected_logits = self.logits.transpose(0, 1)
+            else:
+                corrected_logits = self.logits
+            return -nn.functional.binary_cross_entropy_with_logits(corrected_logits, target, reduction='mean')
         else:
             raise ValueError("Unsupported distribution type")
 
@@ -375,7 +445,7 @@ class DistributionWrapper:
             return self.logits
         elif self.dist_type == "symlog_disc":
             mode = torch.argmax(self.logits, dim=-1)
-            return mode.float()
+            return undisc_symlog(mode, num_bins=self.logits.shape[-1])
         elif self.dist_type == "binary":
             return (self.logits >= 0).float()
         else:
@@ -388,7 +458,8 @@ class DistributionWrapper:
         elif self.dist_type == "symlog_disc":
             probs = torch.softmax(self.logits, dim=-1)
             distribution = torch.distributions.Categorical(probs=probs)
-            return distribution.sample().float()
+            sample_idx = distribution.sample()
+            return undisc_symlog(sample_idx, num_bins=self.logits.shape[-1])
         elif self.dist_type == "binary":
             probs = torch.sigmoid(self.logits)
             return torch.bernoulli(probs)
@@ -409,6 +480,8 @@ class DistributionWrapper:
             return entropy
         else:
             raise ValueError("Unsupported distribution type")
+
+# ---------- RewardEMA ----------
 
 class RewardEMA:
     def __init__(self, device: Any, alpha: float = 1e-2) -> None:

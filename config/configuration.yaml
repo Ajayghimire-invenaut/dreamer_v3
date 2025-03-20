@@ -1,91 +1,115 @@
 default:
-  precision: 32
-  computation_device: "cuda"
-  logging_interval: 100
-  batch_size: 32
-  sequence_length: 50
-  training_update_ratio: 16
-  number_of_pretraining_updates: 1000
-  exploration_termination_step: 10000
-  number_of_possible_actions: 6
-  number_of_environments: 1
-  compile_models: true
-  use_state_mean_for_evaluation: true
-  log_video_predictions: false
-  use_orthogonal_initialization: true
-  optimizer_type: "adamw"
+  # General settings
+  precision: 32                     # Computation precision (16 for AMP, 32 for full precision)
+  computation_device: "cuda"        # Device for computation ("cuda" or "cpu")
+  random_seed: 42                   # Seed for reproducibility
+  action_repeat: 2                  # Number of times actions are repeated in the environment
+  total_training_steps: 1000000     # Total training steps (environment steps)
+  evaluation_interval_steps: 10000  # Steps between evaluations
+  evaluation_number_of_episodes: 5  # Number of episodes for evaluation
+  training_episode_dir: ""          # Directory for training episodes (empty defaults to log_dir/train_episodes)
+  evaluation_episode_dir: ""        # Directory for evaluation episodes (empty defaults to log_dir/eval_episodes)
+  batch_size: 32                    # Batch size for training, ensuring batch-first [B, T, ...]
+  sequence_length: 50               # Length of sequences sampled from episodes
+  number_of_environments: 1         # Number of parallel environments (1 for single env setup)
+  compile_models: true              # Whether to compile models with torch.compile (PyTorch 2.0+)
+  debug: false                      # Enable debug prints across modules (set true for verbose logging)
+
+  # Logging
+  logging_interval: 100             # Frequency of logging metrics (in steps)
+  log_video_predictions: false      # Whether to log video predictions to TensorBoard
+
+  # Optimizer settings
+  optimizer_type: "adamw"           # Optimizer type ("adamw" recommended for stability)
+  model_learning_rate: 1e-4         # Learning rate for world model
+  optimizer_epsilon: 1e-8           # Epsilon for optimizer stability
+  gradient_clip_value: 100.0        # Gradient clipping norm
+  weight_decay_value: 1e-5          # Weight decay coefficient (small value to prevent overfitting)
+
+  # Agent components
   actor:
-    number_of_layers: 2
-    distribution_type: "gaussian"
-    lr: 8e-5
-    eps: 1e-4
-    grad_clip: 100
-    entropy: 0.01
-    standard_deviation: 1.0
-    minimum_standard_deviation: 0.1
-    maximum_standard_deviation: 2.0
-    temperature: 1.0
-    unimix_ratio: 0.0
-    output_scale: 1.0
-    exploration_behavior: "greedy"
+    number_of_layers: 2             # Number of layers in actor network
+    distribution_type: "onehot"     # Distribution type ("onehot" for discrete actions like CartPole)
+    lr: 8e-5                        # Learning rate (adjusted for stability)
+    eps: 1e-8                       # Epsilon for stability
+    grad_clip: 100.0                # Gradient clipping norm
+    entropy: 0.01                   # Entropy coefficient for exploration
+    standard_deviation: 1.0         # Initial standard deviation (for gaussian, unused here)
+    minimum_standard_deviation: 0.1 # Minimum standard deviation (for gaussian, unused here)
+    maximum_standard_deviation: 2.0 # Maximum standard deviation (for gaussian, unused here)
+    temperature: 1.0                # Temperature for distribution sampling
+    unimix_ratio: 0.01              # Uniform mixing ratio for discrete distributions (small value for stability)
+    output_scale: 1.0               # Output scale factor
+    exploration_behavior: "random"  # Exploration strategy ("random" initially, switches to "greedy")
+
   critic:
-    number_of_layers: 2
-    distribution_type: "symlog_disc"
-    lr: 8e-5
-    eps: 1e-4
-    grad_clip: 100
-    use_slow_target: true
-    slow_target_update_interval: 100
-    slow_target_update_fraction: 0.005
-    output_scale: 1.0
-  dynamics_stochastic_dimension: 30
-  dynamics_deterministic_dimension: 200
-  dynamics_hidden_units: 200
-  dynamics_recurrent_depth: 1
-  dynamics_use_discrete: true
-  discrete_latent_num: 32
-  discrete_latent_size: 32
-  dynamics_mean_activation: "linear"
-  dynamics_standard_deviation_activation: "softplus"
-  dynamics_minimum_standard_deviation: 0.1
-  unimix_ratio: 0.0
-  initial_state_type: "zero"
+    number_of_layers: 2             # Number of layers in critic network
+    distribution_type: "symlog_disc" # Distribution type ("symlog_disc" for discrete value prediction)
+    lr: 8e-5                        # Learning rate (adjusted for stability)
+    eps: 1e-8                       # Epsilon for stability
+    grad_clip: 100.0                # Gradient clipping norm
+    use_slow_target: true           # Use slow target network for stability
+    slow_target_update_interval: 100 # Steps between slow target updates
+    slow_target_update_fraction: 0.005 # Fraction of target update (tau, small for gradual updates)
+    output_scale: 1.0               # Output scale factor
+
+  # World model (RSSM) settings
+  dynamics_stochastic_dimension: 32  # Dimension of stochastic state
+  dynamics_deterministic_dimension: 200 # Dimension of deterministic state
+  dynamics_hidden_units: 200        # Hidden units in dynamics MLP
+  dynamics_recurrent_depth: 1       # Depth of recurrent layers (GRU typically 1)
+  dynamics_use_discrete: true       # Use discrete latent states (common in Dreamer-V3)
+  discrete_latent_num: 32           # Number of discrete latent categories
+  discrete_latent_size: 32          # Size of each discrete latent
+  dynamics_mean_activation: "linear" # Activation for mean in dynamics (unused for discrete)
+  dynamics_standard_deviation_activation: "softplus" # Activation for std (unused for discrete)
+  dynamics_minimum_standard_deviation: 0.1 # Minimum standard deviation (unused for discrete)
+  unimix_ratio: 0.01                # Uniform mixing ratio for discrete distributions
+  initial_state_type: "zero"        # Initial state initialization ("zero" for simplicity)
+
+  # Encoder/Decoder
   encoder:
-    output_dimension: 1024
+    output_dimension: 1024          # Output dimension of encoder (matches CNN output)
   decoder:
-    dummy_parameter: null
+    dummy_parameter: null           # Placeholder for future use
+    loss_scale: 1.0                 # Added loss scale for decoder (consistency with other heads)
+
+  # Prediction heads
   reward_head:
-    distribution_type: "symlog_disc"
-    number_of_layers: 2
-    output_scale: 1.0
-    loss_scale: 1.0
+    distribution_type: "symlog_disc" # Distribution type for reward prediction
+    number_of_layers: 2             # Number of layers
+    output_scale: 1.0               # Output scale factor
+    loss_scale: 0.5                 # Loss scaling factor (balanced with KL)
   continuation_head:
-    number_of_layers: 2
-    output_scale: 1.0
-    loss_scale: 1.0
-  units: 256
-  activation_function: "relu"
-  normalization_type: "layer"
-  model_learning_rate: 1e-4
-  optimizer_epsilon: 1e-4
-  gradient_clip_value: 100
-  weight_decay_value: 1e-4
-  discount_factor: 0.997
-  discount_lambda: 0.95
-  kl_free: 1.0
-  dynamics_loss_scale: 1.0
-  representation_loss_scale: 1.0
-  gradient_head_keys: ["decoder", "reward", "continuation"]
-  augmentation_enabled: true
-  augmentation_crop_size: 64
-  exploration_behavior: "greedy"
-  random_seed: 42
-  action_repeat: 2
-  total_training_steps: 1000000
-  evaluation_interval_steps: 10000
-  evaluation_number_of_episodes: 5
-  training_episode_dir: ""
-  evaluation_episode_dir: ""
-  os_name: "posix"
-  reward_EMA: false
-  imag_horizon: 15
+    number_of_layers: 2             # Number of layers
+    output_scale: 1.0               # Output scale factor
+    loss_scale: 0.1                 # Loss scaling factor (smaller as it's auxiliary)
+
+  # Network settings
+  units: 256                        # Default units in MLP layers
+  activation_function: "relu"       # Activation function
+  normalization_type: "layer"       # Normalization type ("layer" for better stability)
+  use_orthogonal_initialization: true # Use orthogonal initialization (recommended for RNNs/MLPs)
+
+  # Training hyperparameters
+  training_updates_per_forward: 1   # Number of training updates per environment step
+  number_of_pretraining_updates: 1000 # Pretraining updates (unused in current setup)
+  exploration_termination_step: 50000 # Step to switch from exploration to exploitation
+  discount_factor: 0.997            # Discount factor for rewards (close to 1 for long horizons)
+  discount_lambda: 0.95             # Lambda for return computation
+  kl_free: 1.0                      # Free bits for KL divergence (encourages exploration)
+  dynamics_loss_scale: 6.0          # Scale for dynamics KL loss (emphasizes dynamics learning)
+  representation_loss_scale: 0.1    # Scale for representation KL loss (lighter weight)
+  gradient_head_keys: ["decoder"]   # Heads to propagate gradients through (focus on reconstruction)
+  imag_horizon: 15                  # Imagination horizon for rollouts
+
+  # Data augmentation
+  augmentation_enabled: true        # Enable image augmentation (improves robustness)
+  augmentation_crop_size: 64        # Crop size for augmentation (matches typical input size)
+
+  # Miscellaneous
+  use_state_mean_for_evaluation: true # Use mean state for evaluation (stabilizes inference)
+  reward_EMA: false                 # Use exponential moving average for rewards (disabled for simplicity)
+  number_of_possible_actions: 2     # Number of actions (e.g., for CartPole, adjust per task)
+  os_name: "posix"                  # Operating system identifier (adjust for your system)
+  max_samples_per_epoch: 10000      # Maximum samples per epoch for dataset

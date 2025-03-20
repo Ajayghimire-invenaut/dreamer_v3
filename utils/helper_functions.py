@@ -22,7 +22,6 @@ def discretize_symlog(x: torch.Tensor, num_bins: int = 255, low: float = -10.0, 
     """
     y = symlog(x)
     y_clamped = torch.clamp(y, low, high)
-    # Map clamped values to bins in 0..(num_bins-1)
     bins = ((y_clamped - low) / (high - low) * (num_bins - 1)).long()
     return bins
 
@@ -50,13 +49,9 @@ def orthogonal_initialize(module: nn.Module, gain: Optional[float] = None) -> No
 class RewardObjective(nn.Module):
     def __init__(self, clip_value: float = 5.0, alpha: float = 0.01):
         """
-        Compares the predicted reward (obtained via the reward head’s mode)
-        against the ground-truth reward (if provided) using an EMA baseline.
-        If ground_truth_reward is not provided, the intrinsic reward is simply
-        the clamped predicted reward.
-
-        NOTE: If using symlog discretization, this module applies symlog to the
-        ground-truth reward so that it is in the same space as the predictions.
+        Compares the predicted reward against ground-truth reward (if provided) using an EMA baseline.
+        If no ground-truth is provided, returns clamped predicted reward as intrinsic reward.
+        Assumes batch-first input: [B, H, feature_dim].
         """
         super(RewardObjective, self).__init__()
         self.clip_value = clip_value
@@ -64,121 +59,145 @@ class RewardObjective(nn.Module):
         self.register_buffer("baseline", torch.tensor(0.0))
     
     def forward(self, imagined_features: torch.Tensor, world_model: Any, ground_truth_reward: Optional[torch.Tensor] = None) -> torch.Tensor:
-        predicted_reward = world_model.heads["reward"](imagined_features).mode()
-        print(f"[DEBUG RewardObjective] predicted_reward mean: {predicted_reward.mean().item():.4f}, std: {predicted_reward.std().item():.4f}", flush=True)
-        
-        # If using symlog discretization, transform the ground-truth reward into symlog space.
-        if ground_truth_reward is not None and world_model.configuration.reward_head["distribution_type"] == "symlog_disc":
-            ground_truth_reward = symlog(ground_truth_reward)
-            print(f"[DEBUG RewardObjective] ground_truth_reward after symlog transform mean: {ground_truth_reward.mean().item():.4f}, std: {ground_truth_reward.std().item():.4f}", flush=True)
+        # Input: [B, H, feature_dim]
+        reward_dist = world_model.heads["reward"](imagined_features)  # [B, H, ...]
+        predicted_reward = reward_dist.mode()  # [B, H, 1]
+        if getattr(world_model.configuration, "debug", False):
+            print(f"[DEBUG RewardObjective] predicted_reward shape: {predicted_reward.shape}, "
+                  f"mean: {predicted_reward.mean().item():.4f}, std: {predicted_reward.std().item():.4f}", flush=True)
         
         if ground_truth_reward is not None:
-            error = predicted_reward - ground_truth_reward
-            print(f"[DEBUG RewardObjective] error mean: {error.mean().item():.4f}, std: {error.std().item():.4f}", flush=True)
-            # Update baseline with EMA.
+            if world_model.configuration.reward_head["distribution_type"] == "symlog_disc":
+                # Keep predicted reward in symlog space for comparison
+                predicted_symlog = reward_dist.logits.max(dim=-1)[1]  # [B, H]
+                predicted_symlog_value = undisc_symlog(predicted_symlog, num_bins=255)  # [B, H]
+                ground_truth_symlog = symlog(ground_truth_reward)  # [B, H]
+                if getattr(world_model.configuration, "debug", False):
+                    print(f"[DEBUG RewardObjective] ground_truth_symlog shape: {ground_truth_symlog.shape}, "
+                          f"mean: {ground_truth_symlog.mean().item():.4f}, std: {ground_truth_symlog.std().item():.4f}", flush=True)
+                error = predicted_symlog_value - ground_truth_symlog
+            else:
+                error = predicted_reward - ground_truth_reward  # [B, H, 1]
+            
+            if getattr(world_model.configuration, "debug", False):
+                print(f"[DEBUG RewardObjective] error shape: {error.shape}, "
+                      f"mean: {error.mean().item():.4f}, std: {error.std().item():.4f}", flush=True)
             self.baseline = self.alpha * error.mean() + (1 - self.alpha) * self.baseline
-            print(f"[DEBUG RewardObjective] updated baseline: {self.baseline.item():.4f}", flush=True)
+            if getattr(world_model.configuration, "debug", False):
+                print(f"[DEBUG RewardObjective] updated baseline: {self.baseline.item():.4f}", flush=True)
             error = error - self.baseline
             error = torch.clamp(error, -self.clip_value, self.clip_value)
-            intrinsic_reward = torch.abs(error)
+            intrinsic_reward = torch.abs(error)  # [B, H, 1] or [B, H]
         else:
-            intrinsic_reward = torch.clamp(predicted_reward, -self.clip_value, self.clip_value)
+            intrinsic_reward = torch.clamp(predicted_reward, -self.clip_value, self.clip_value)  # [B, H, 1]
         
-        print(f"[DEBUG RewardObjective] intrinsic_reward mean: {intrinsic_reward.mean().item():.4f}, std: {intrinsic_reward.std().item():.4f}", flush=True)
+        if intrinsic_reward.dim() == 2:
+            intrinsic_reward = intrinsic_reward.unsqueeze(-1)  # Ensure [B, H, 1]
+        
+        if getattr(world_model.configuration, "debug", False):
+            print(f"[DEBUG RewardObjective] intrinsic_reward shape: {intrinsic_reward.shape}, "
+                  f"mean: {intrinsic_reward.mean().item():.4f}, std: {intrinsic_reward.std().item():.4f}", flush=True)
         return intrinsic_reward
 
 #########################################
 # Prediction Step: Decoder + Encoder
 #########################################
 def predict_next_embedding(state: Dict[str, torch.Tensor],
-                           action: torch.Tensor,
-                           world_model: Any,
-                           encoder: Any) -> torch.Tensor:
+                          action: torch.Tensor,
+                          world_model: Any,
+                          encoder: Any) -> torch.Tensor:
     """
-    Uses the world model’s decoder to predict the next observation distribution,
-    then takes its mode and feeds the resulting image through the encoder to obtain
-    the next latent embedding.
+    Predicts next observation via decoder and encodes it.
+    Input state: Dict[B, ...], action: [B, action_dim]
+    Output: [B, embed_dim]
     """
-    features = world_model.dynamics.get_features(state)
-    predicted_obs_distribution = world_model.heads["decoder"](features)
-    predicted_obs = predicted_obs_distribution["image"].mode()  # alternatively, use .sample()
-    print(f"[DEBUG predict_next_embedding] predicted_obs shape: {predicted_obs.shape}", flush=True)
-    predicted_embedding = encoder({"image": predicted_obs})
-    print(f"[DEBUG predict_next_embedding] predicted_embedding mean: {predicted_embedding.mean().item():.4f}, std: {predicted_embedding.std().item():.4f}", flush=True)
+    features = world_model.dynamics.get_features(state)  # [B, feature_dim] or [B, T, feature_dim]
+    if features.dim() == 3:
+        features = features[:, -1, :]  # Take last timestep if multi-step: [B, feature_dim]
+    predicted_obs_dist = world_model.heads["decoder"](features)  # [B, C, H, W]
+    predicted_obs = predicted_obs_dist["image"].mode()  # [B, C, H, W]
+    if getattr(world_model.configuration, "debug", False):
+        print(f"[DEBUG predict_next_embedding] predicted_obs shape: {predicted_obs.shape}", flush=True)
+    predicted_embedding = encoder({"image": predicted_obs})  # [B, embed_dim]
+    if getattr(world_model.configuration, "debug", False):
+        print(f"[DEBUG predict_next_embedding] predicted_embedding shape: {predicted_embedding.shape}, "
+              f"mean: {predicted_embedding.mean().item():.4f}, std: {predicted_embedding.std().item():.4f}", flush=True)
     return predicted_embedding
 
 #########################################
 # Rollout (Imagination) Step with Debug
 #########################################
 def imagine_trajectory(start_state: Dict[str, torch.Tensor],
-                       horizon: int,
-                       dynamics_model: Any,
-                       actor: Any,
-                       world_model: Any,
-                       encoder: Any,
-                       configuration: Any) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], torch.Tensor]:
+                      horizon: int,
+                      dynamics_model: Any,
+                      actor: Any,
+                      world_model: Any,
+                      encoder: Any,
+                      configuration: Any) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
     """
     Rolls out the dynamics model for a given horizon.
-    For each time step:
-      1. Extracts features from the current state.
-      2. Samples an action using the actor.
-      3. Predicts the next latent embedding via the decoder-encoder loop.
-      4. Updates the state with a one-step transition.
-    
-    The outputs are stacked in time-first order and then transposed to batch-first.
+    Outputs are batch-first: [B, H, ...].
+    Returns features, state, actions, and action indices.
     """
     batch_size = start_state["deter"].shape[0]
     feature_list = []
     state_history = {key: [] for key in start_state.keys()}
     actions_list = []
-    state = start_state
+    action_indices_list = []
+    state = {k: v.clone() for k, v in start_state.items()}
 
     for t in range(horizon):
-        features = dynamics_model.get_features(state)
-        print(f"[DEBUG imagine_trajectory] Step {t}: raw features shape: {features.shape}", flush=True)
-        # Ensure features have an explicit time dimension.
-        if features.dim() == 2:
-            features = features.unsqueeze(0)  # [1, B, f]
-        elif features.dim() == 3 and features.size(0) != 1:
-            # If more than one time step exists, use only the last step.
-            features = features[-1:].clone()
-            print(f"[DEBUG imagine_trajectory] Step {t}: reduced features shape: {features.shape}", flush=True)
+        features = dynamics_model.get_features(state)  # [B, feature_dim] or [B, T, feature_dim]
+        if getattr(configuration, "debug", False):
+            print(f"[DEBUG imagine_trajectory] Step {t}: raw features shape: {features.shape}", flush=True)
+        if features.dim() == 3:
+            features = features[:, -1, :]  # [B, feature_dim]
+            if getattr(configuration, "debug", False):
+                print(f"[DEBUG imagine_trajectory] Step {t}: reduced features shape: {features.shape}", flush=True)
         feature_list.append(features)
-        actor_dist = actor(features.detach())  # Detach features to avoid leaking gradients.
-        action = actor_dist.sample()
+        
+        actor_dist = actor(features.detach())
+        action_indices = actor_dist.sample()  # [B] or [B, action_dim]
+        if action_indices.dim() == 1:  # Discrete actions
+            action = F.one_hot(action_indices.long(), num_classes=configuration.number_of_possible_actions).float()  # [B, num_actions]
+            action_indices_list.append(action_indices)
+        else:  # Continuous actions
+            action = action_indices
+            action_indices_list.append(action)
         actions_list.append(action)
-        print(f"[DEBUG imagine_trajectory] Step {t}: action shape: {action.shape}", flush=True)
+        if getattr(configuration, "debug", False):
+            print(f"[DEBUG imagine_trajectory] Step {t}: action shape: {action.shape}, "
+                  f"action_indices shape: {action_indices.shape}", flush=True)
+        
         predicted_embedding = predict_next_embedding(state, action, world_model, encoder)
-        if predicted_embedding.dim() == 2:
-            predicted_embedding = predicted_embedding.unsqueeze(0)
-            print(f"[DEBUG imagine_trajectory] Step {t}: expanded predicted_embedding shape: {predicted_embedding.shape}", flush=True)
-        # Update the state using a one-step transition. Squeeze the predicted embedding’s time dimension.
+        if predicted_embedding.dim() == 3:
+            predicted_embedding = predicted_embedding.squeeze(0)
+            if getattr(configuration, "debug", False):
+                print(f"[DEBUG imagine_trajectory] Step {t}: squeezed predicted_embedding shape: {predicted_embedding.shape}", flush=True)
+        
         state, _ = dynamics_model.observe_step(
-            state, action, predicted_embedding.squeeze(0), torch.ones(batch_size, device=dynamics_model.device)
+            state, action, predicted_embedding, torch.ones(batch_size, device=dynamics_model.device)
         )
         for key, value in state.items():
             state_history[key].append(value)
+
+    imagined_features = torch.stack(feature_list, dim=1)  # [B, H, feature_dim]
+    imagined_state = {key: torch.stack(vals, dim=1) for key, vals in state_history.items()}  # Dict[B, H, ...]
+    imagined_actions = torch.stack(actions_list, dim=1)  # [B, H, action_dim]
+    imagined_action_indices = torch.stack(action_indices_list, dim=1)  # [B, H] or [B, H, action_dim]
     
-    # Stack results along the time dimension (results are [T, B, ...]).
-    imagined_features = torch.stack(feature_list, dim=0)
-    imagined_actions = torch.stack(actions_list, dim=0)
-    imagined_state = {key: torch.stack(vals, dim=0) for key, vals in state_history.items()}
+    if getattr(configuration, "debug", False):
+        print(f"[DEBUG imagine_trajectory] Final imagined_features shape: {imagined_features.shape}", flush=True)
+        print(f"[DEBUG imagine_trajectory] Final imagined_actions shape: {imagined_actions.shape}", flush=True)
+        print(f"[DEBUG imagine_trajectory] Final imagined_action_indices shape: {imagined_action_indices.shape}", flush=True)
     
-    # Transpose from time-first [T, B, ...] to batch-first [B, T, ...].
-    imagined_features = imagined_features.transpose(0, 1)
-    imagined_actions = imagined_actions.transpose(0, 1)
-    imagined_state = {key: value.transpose(0, 1) for key, value in imagined_state.items()}
-    
-    print(f"[DEBUG imagine_trajectory] Final imagined_features shape: {imagined_features.shape}", flush=True)
-    print(f"[DEBUG imagine_trajectory] Final imagined_actions shape: {imagined_actions.shape}", flush=True)
-    
-    return imagined_features, imagined_state, imagined_actions
+    return imagined_features, imagined_state, imagined_actions, imagined_action_indices
 
 #########################################
 # Lambda-Return Target and Other Utilities
 #########################################
-def lambda_return_target(reward, value, discount, lambda_):
-    # Ensure reward and value have shape [T, B, 1]
+def lambda_return_target(reward: torch.Tensor, value: torch.Tensor, discount: float, lambda_: float) -> Tuple[List[torch.Tensor], List[torch.Tensor], torch.Tensor]:
+    # Input: [H, B, 1] for reward and value
     if reward.dim() == 2:
         reward = reward.unsqueeze(-1)
     if value.dim() == 2:
@@ -187,28 +206,34 @@ def lambda_return_target(reward, value, discount, lambda_):
     if value.shape[0] == T:
         value = torch.cat([value, value[-1:].clone()], dim=0)
     assert value.shape[0] == T + 1, "Value tensor must have T+1 timesteps"
-    target_list = [value[-1]]  # bootstrap
-    weight_list = [torch.ones_like(reward[0])]
+    target_list = [value[-1]]  # [B, 1]
+    weight_list = [torch.ones_like(reward[0])]  # [B, 1]
     for t in reversed(range(T)):
         current_target = reward[t] + discount * ((1 - lambda_) * value[t+1] + lambda_ * target_list[0])
         target_list.insert(0, current_target)
         current_weight = discount * lambda_ * weight_list[0]
         weight_list.insert(0, current_weight)
     baseline = value[:-1].transpose(0, 1)  # [B, T, 1]
-    final_targets = target_list[:-1]  # list of T tensors, each [B, 1]
-    final_weights = weight_list[:-1]
+    final_targets = target_list[:-1]  # List[T] of [B, 1]
+    final_weights = weight_list[:-1]  # List[T] of [B, 1]
     return final_targets, final_weights, baseline
 
-def compute_actor_loss(actor, features, actions, target, weights, baseline, value_network, configuration):
-    # Detach features so that actor loss does not backprop into the world model.
-    features_detached = features.detach()
-    dist = actor(features_detached)
-    log_prob = dist.log_prob(actions)
-    target_stack = torch.stack(target, dim=1)  # shape [B, T, 1]
-    advantage = (target_stack - baseline).detach()
-    entropy = dist.entropy()
-    weights_stack = torch.stack(weights, dim=1)  # shape [B, T, 1]
-    actor_loss = - (log_prob * advantage * weights_stack).mean() - configuration.actor.get("entropy", 0.0) * entropy.mean()
+def compute_actor_loss(actor: Any, features: torch.Tensor, actions: torch.Tensor, 
+                      action_indices: torch.Tensor, target: List[torch.Tensor], 
+                      weights: List[torch.Tensor], baseline: torch.Tensor, 
+                      value_network: Any, configuration: Any) -> Tuple[torch.Tensor, Dict[str, float]]:
+    features_detached = features.detach()  # [B, H, feature_dim]
+    dist = actor(features_detached)  # [B, H, action_dim]
+    if action_indices.dim() == 2:  # Discrete: [B, H]
+        log_prob = dist.log_prob(action_indices)  # [B, H]
+    else:  # Continuous: [B, H, action_dim]
+        log_prob = dist.log_prob(actions)  # [B, H]
+    
+    target_stack = torch.stack(target, dim=1)  # [B, T, 1]
+    advantage = (target_stack - baseline).detach()  # [B, T, 1]
+    entropy = dist.entropy()  # [B, H]
+    weights_stack = torch.stack(weights, dim=1)  # [B, T, 1]
+    actor_loss = - (log_prob * advantage.squeeze(-1) * weights_stack.squeeze(-1)).mean() - configuration.actor.get("entropy", 0.0) * entropy.mean()
     loss_metrics = {"actor_loss": actor_loss.item(), "policy_entropy": entropy.mean().item()}
     return actor_loss, loss_metrics
 
@@ -255,7 +280,7 @@ def count_episode_steps(directory: Any) -> int:
             continue
     return total
 
-def tensor_to_numpy(tensor):
+def tensor_to_numpy(tensor: Any) -> np.ndarray:
     if isinstance(tensor, torch.Tensor):
         return tensor.detach().cpu().numpy()
     else:
@@ -264,16 +289,21 @@ def tensor_to_numpy(tensor):
 class OneHotDistribution:
     def __init__(self, logits: torch.Tensor) -> None:
         self.logits = logits
+
     def log_prob(self, value: torch.Tensor) -> torch.Tensor:
         return -((self.logits - value) ** 2).mean()
+
     def mode(self) -> torch.Tensor:
-        return F.one_hot(torch.argmax(self.logits, dim=-1),
-                         num_classes=self.logits.shape[-1]).float()
+        return F.one_hot(torch.argmax(self.logits, dim=-1), num_classes=self.logits.shape[-1]).float()
+
     def sample(self) -> torch.Tensor:
         probabilities = torch.softmax(self.logits, dim=-1)
         sample_indices = torch.multinomial(probabilities, num_samples=1)
-        return F.one_hot(sample_indices.squeeze(-1),
-                         num_classes=self.logits.shape[-1]).float()
+        return F.one_hot(sample_indices.squeeze(-1), num_classes=self.logits.shape[-1]).float()
+
+    def entropy(self) -> torch.Tensor:
+        probabilities = torch.softmax(self.logits, dim=-1)
+        return -torch.sum(probabilities * torch.log(probabilities + 1e-8), dim=-1)  # [B] or [B, H]
 
 class DistributionWrapper:
     def __init__(self, logits: torch.Tensor, dist_type: str = "gaussian") -> None:
@@ -288,7 +318,6 @@ class DistributionWrapper:
             return -((self.logits - target) ** 2).mean()
         elif self.dist_type == "symlog_disc":
             target = target.long().squeeze(-1)
-            # Use reshape instead of view.
             logits_flat = self.logits.reshape(-1, self.logits.shape[-1])
             return -nn.functional.cross_entropy(logits_flat, target.reshape(-1), reduction='mean')
         elif self.dist_type == "binary":

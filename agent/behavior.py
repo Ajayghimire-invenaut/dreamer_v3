@@ -23,9 +23,10 @@ import copy
 class ImaginedBehavior(nn.Module):
     def __init__(self, configuration: Any, world_model: Any) -> None:
         super(ImaginedBehavior, self).__init__()
-        self.use_amp = (configuration.precision == 16)
+        self.use_amp = (configuration.precision == 16) and torch.cuda.is_available()  # Disable AMP on CPU
         self.configuration = configuration
         self.world_model = world_model
+        self.debug = configuration.debug
 
         if configuration.dynamics_use_discrete:
             feature_dimension = (configuration.discrete_latent_num *
@@ -73,26 +74,41 @@ class ImaginedBehavior(nn.Module):
         else:
             self.slow_value = None
 
-        optimizer_args = dict(weight_decay=configuration.weight_decay_value,
-                            opt=configuration.optimizer_type,
-                            use_amp=self.use_amp)
-        self.actor_optimizer = Optimizer("actor", self.actor.parameters(),
-                                       learning_rate=configuration.actor["lr"],
-                                       eps=configuration.actor["eps"],
-                                       clip=configuration.actor["grad_clip"],
-                                       **optimizer_args)
-        self.value_optimizer = Optimizer("value", self.value.parameters(),
-                                       learning_rate=configuration.critic["lr"],
-                                       eps=configuration.critic["eps"],
-                                       clip=configuration.critic["grad_clip"],
-                                       **optimizer_args)
+        optimizer_args = dict(
+            weight_decay=configuration.weight_decay_value,
+            opt=configuration.optimizer_type,
+            use_amp=self.use_amp,
+            debug=self.debug  # Pass debug flag
+        )
+        self.actor_optimizer = Optimizer(
+            "actor",
+            self.actor.parameters(),
+            learning_rate=configuration.actor["lr"],
+            eps=configuration.actor["eps"],
+            clip=configuration.actor["grad_clip"],  # 10.0
+            **optimizer_args
+        )
+        self.value_optimizer = Optimizer(
+            "value",
+            self.value.parameters(),
+            learning_rate=configuration.critic["lr"],
+            eps=configuration.critic["eps"],
+            clip=configuration.critic["grad_clip"],  # 100.0
+            **optimizer_args
+        )
         self.reward_objective = RewardObjective(clip_value=5.0, alpha=0.01)
         
+        if self.debug:
+            print(f"[DEBUG ImaginedBehavior] Actor grad_clip: {configuration.actor['grad_clip']}, "
+                  f"Critic grad_clip: {configuration.critic['grad_clip']}", flush=True)
+
     def train_step(self, starting_state: Any, objective_function: Any = None) -> Tuple[torch.Tensor, Any, torch.Tensor, torch.Tensor, Dict[str, float]]:
         self._update_slow_target()
         metrics: Dict[str, float] = {}
+        
+        # Ensure AMP is disabled on CPU
         with torch.amp.autocast("cuda", enabled=self.use_amp):
-            # Generate imagined trajectories (now returns 4 values)
+            # Generate imagined trajectories
             imagined_features, imagined_state, imagined_actions, imagined_action_indices = imagine_trajectory(
                 starting_state,
                 self.configuration.imag_horizon,
@@ -102,20 +118,17 @@ class ImaginedBehavior(nn.Module):
                 self.world_model.encoder,
                 self.configuration
             )  # [B, H, feature_dim], Dict[B, H, ...], [B, H, action_dim], [B, H] or [B, H, action_dim]
-            if getattr(self.configuration, "debug", False):
-                print("[DEBUG ImaginedBehavior] Imagined features shape:", imagined_features.shape)
-                print("[DEBUG ImaginedBehavior] Imagined actions shape:", imagined_actions.shape)
-                print("[DEBUG ImaginedBehavior] Imagined action indices shape:", imagined_action_indices.shape)
+            if self.debug:
+                print("[DEBUG ImaginedBehavior] Imagined features shape:", imagined_features.shape, flush=True)
+                print("[DEBUG ImaginedBehavior] Imagined actions shape:", imagined_actions.shape, flush=True)
+                print("[DEBUG ImaginedBehavior] Imagined action indices shape:", imagined_action_indices.shape, flush=True)
 
-            # Compute intrinsic reward with batch-first features
-            intrinsic_reward = self.reward_objective(
-                imagined_features,  # [B, H, feature_dim]
-                self.world_model
-            )  # [B, H, 1]
+            # Compute intrinsic reward
+            intrinsic_reward = self.reward_objective(imagined_features, self.world_model)  # [B, H, 1]
             if intrinsic_reward.dim() == 2:
                 intrinsic_reward = intrinsic_reward.unsqueeze(-1)
-            if getattr(self.configuration, "debug", False):
-                print("[DEBUG ImaginedBehavior] Intrinsic reward shape:", intrinsic_reward.shape)
+            if self.debug:
+                print("[DEBUG ImaginedBehavior] Intrinsic reward shape:", intrinsic_reward.shape, flush=True)
 
             # Ensure state has 'deter'
             if "deter" not in imagined_state:
@@ -127,8 +140,8 @@ class ImaginedBehavior(nn.Module):
             else:
                 im_state = imagined_state
             full_imagined_features = self.world_model.dynamics.get_features(im_state)  # [B, H, feature_dim]
-            if getattr(self.configuration, "debug", False):
-                print("[DEBUG ImaginedBehavior] Full imagined features shape:", full_imagined_features.shape)
+            if self.debug:
+                print("[DEBUG ImaginedBehavior] Full imagined features shape:", full_imagined_features.shape, flush=True)
 
             # Compute value predictions and lambda-return targets
             value_preds = self.value(full_imagined_features).mode()  # [B, H, 1]
@@ -138,10 +151,10 @@ class ImaginedBehavior(nn.Module):
                 self.configuration.discount_factor,
                 self.configuration.discount_lambda
             )  # target: List[H] of [B, 1], weights: List[H] of [B, 1], baseline: [B, H, 1]
-            if getattr(self.configuration, "debug", False):
-                print("[DEBUG ImaginedBehavior] Lambda-return target stack shape (full):", torch.stack(target, dim=1).shape)
+            if self.debug:
+                print("[DEBUG ImaginedBehavior] Lambda-return target stack shape (full):", torch.stack(target, dim=1).shape, flush=True)
 
-            # Compute actor loss with action indices
+            # Compute actor loss
             actor_loss, loss_metrics = compute_actor_loss(
                 actor=self.actor,
                 features=full_imagined_features.detach(),
@@ -156,22 +169,22 @@ class ImaginedBehavior(nn.Module):
             actor_loss = torch.mean(actor_loss)
             metrics.update(loss_metrics)
 
-        # Compute value loss with correct slicing
+        # Compute value loss
         with torch.amp.autocast("cuda", enabled=self.use_amp):
             predicted_value = self.value(full_imagined_features[:, :-1].detach())  # [B, H-1, ...]
             target_stack = torch.stack(target[:-1], dim=1)  # [B, H-1, 1]
-            if getattr(self.configuration, "debug", False):
-                print("[DEBUG ImaginedBehavior] predicted_value shape:", 
-                      predicted_value.logits.shape if hasattr(predicted_value, 'logits') else predicted_value.shape)
-                print("[DEBUG ImaginedBehavior] target_stack shape (trimmed):", target_stack.shape)
+            if self.debug:
+                print("[DEBUG ImaginedBehavior] Predicted value shape:", 
+                      predicted_value.logits.shape if hasattr(predicted_value, 'logits') else predicted_value.shape, flush=True)
+                print("[DEBUG ImaginedBehavior] Target stack shape (trimmed):", target_stack.shape, flush=True)
 
             if self.configuration.critic["distribution_type"] == "symlog_disc":
                 target_stack_bins = discretize_symlog(target_stack, num_bins=255)  # [B, H-1]
                 value_loss = -predicted_value.log_prob(target_stack_bins.detach())  # [B, H-1]
             else:
                 value_loss = -predicted_value.log_prob(target_stack.detach())  # [B, H-1]
-            if getattr(self.configuration, "debug", False):
-                print("[DEBUG ImaginedBehavior] value_loss shape after log_prob:", value_loss.shape)
+            if self.debug:
+                print("[DEBUG ImaginedBehavior] Value loss shape after log_prob:", value_loss.shape, flush=True)
 
             if self.configuration.critic.get("use_slow_target", False) and self.slow_value is not None:
                 slow_target_output = self.slow_value(full_imagined_features[:, :-1].detach())
@@ -183,15 +196,18 @@ class ImaginedBehavior(nn.Module):
 
             weights_stack = torch.stack(weights[:-1], dim=1).squeeze(-1)  # [B, H-1]
             value_loss = torch.mean(weights_stack * value_loss)
-            if getattr(self.configuration, "debug", False):
-                print("[DEBUG ImaginedBehavior] Final value_loss:", value_loss.item())
+            if self.debug:
+                print("[DEBUG ImaginedBehavior] Final value_loss:", value_loss.item(), flush=True)
 
-        # Update metrics
+        # Update optimizers and metrics
         metrics.update(tensor_stats(predicted_value.mode(), "value"))
         metrics.update(tensor_stats(target_stack, "target"))
-        metrics.update(tensor_stats(intrinsic_reward, "intrinsic_reward"))  # Already batch-first
+        metrics.update(tensor_stats(intrinsic_reward, "intrinsic_reward"))
         metrics.update(self.actor_optimizer(actor_loss, self.actor.parameters()))
         metrics.update(self.value_optimizer(value_loss, self.value.parameters()))
+
+        if self.debug:
+            print(f"[DEBUG ImaginedBehavior] Train step metrics: {metrics}", flush=True)
 
         return imagined_features, imagined_state, imagined_actions, weights, metrics
 
@@ -201,6 +217,8 @@ class ImaginedBehavior(nn.Module):
                 mix_fraction = self.configuration.critic["slow_target_update_fraction"]
                 for fast_param, slow_param in zip(self.value.parameters(), self.slow_value.parameters()):
                     slow_param.data = mix_fraction * fast_param.data + (1 - mix_fraction) * slow_param.data
+                if self.debug:
+                    print(f"[DEBUG ImaginedBehavior] Updated slow target with fraction {mix_fraction}", flush=True)
             self.update_counter += 1
 
     def collect_optimizer_states(self) -> Dict[str, Any]:

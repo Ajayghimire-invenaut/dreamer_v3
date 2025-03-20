@@ -12,18 +12,18 @@ default:
   batch_size: 32                    # Batch size for training, ensuring batch-first [B, T, ...]
   sequence_length: 50               # Length of sequences sampled from episodes
   number_of_environments: 1         # Number of parallel environments (1 for single env setup)
-  compile_models: true              # Whether to compile models with torch.compile (PyTorch 2.0+)
-  debug: false                      # Enable debug prints across modules (set true for verbose logging)
+  compile_models: false             # Changed to false (PyTorch 2.0+ required, using CPU here)
+  debug: true                       # Changed to true for verbose logging to diagnose issues
 
   # Logging
   logging_interval: 100             # Frequency of logging metrics (in steps)
-  log_video_predictions: false      # Whether to log video predictions to TensorBoard
+  log_video_predictions: true       # Changed to true to visualize predictions and debug
 
   # Optimizer settings
   optimizer_type: "adamw"           # Optimizer type ("adamw" recommended for stability)
   model_learning_rate: 1e-4         # Learning rate for world model
   optimizer_epsilon: 1e-8           # Epsilon for optimizer stability
-  gradient_clip_value: 100.0        # Gradient clipping norm
+  gradient_clip_value: 100.0        # Gradient clipping norm (global, kept for consistency)
   weight_decay_value: 1e-5          # Weight decay coefficient (small value to prevent overfitting)
 
   # Agent components
@@ -32,22 +32,22 @@ default:
     distribution_type: "onehot"     # Distribution type ("onehot" for discrete actions like CartPole)
     lr: 8e-5                        # Learning rate (adjusted for stability)
     eps: 1e-8                       # Epsilon for stability
-    grad_clip: 100.0                # Gradient clipping norm
-    entropy: 0.01                   # Entropy coefficient for exploration
-    standard_deviation: 1.0         # Initial standard deviation (for gaussian, unused here)
-    minimum_standard_deviation: 0.1 # Minimum standard deviation (for gaussian, unused here)
-    maximum_standard_deviation: 2.0 # Maximum standard deviation (for gaussian, unused here)
+    grad_clip: 10.0                 # Reduced from 100.0 to prevent gradient explosion
+    entropy: 0.1                    # Increased from 0.01 to encourage exploration
+    standard_deviation: 1.0         # Initial standard deviation (unused here)
+    minimum_standard_deviation: 0.1 # Minimum standard deviation (unused here)
+    maximum_standard_deviation: 2.0 # Maximum standard deviation (unused here)
     temperature: 1.0                # Temperature for distribution sampling
-    unimix_ratio: 0.01              # Uniform mixing ratio for discrete distributions (small value for stability)
+    unimix_ratio: 0.01              # Uniform mixing ratio for discrete distributions
     output_scale: 1.0               # Output scale factor
-    exploration_behavior: "random"  # Exploration strategy ("random" initially, switches to "greedy")
+    exploration_behavior: "random"  # Exploration strategy ("random" initially)
 
   critic:
     number_of_layers: 2             # Number of layers in critic network
     distribution_type: "symlog_disc" # Distribution type ("symlog_disc" for discrete value prediction)
     lr: 8e-5                        # Learning rate (adjusted for stability)
     eps: 1e-8                       # Epsilon for stability
-    grad_clip: 100.0                # Gradient clipping norm
+    grad_clip: 100.0                # Gradient clipping norm (kept moderate)
     use_slow_target: true           # Use slow target network for stability
     slow_target_update_interval: 100 # Steps between slow target updates
     slow_target_update_fraction: 0.005 # Fraction of target update (tau, small for gradual updates)
@@ -72,7 +72,7 @@ default:
     output_dimension: 1024          # Output dimension of encoder (matches CNN output)
   decoder:
     dummy_parameter: null           # Placeholder for future use
-    loss_scale: 1.0                 # Added loss scale for decoder (consistency with other heads)
+    loss_scale: 1.0                 # Loss scale for decoder
 
   # Prediction heads
   reward_head:
@@ -92,7 +92,7 @@ default:
   use_orthogonal_initialization: true # Use orthogonal initialization (recommended for RNNs/MLPs)
 
   # Training hyperparameters
-  training_updates_per_forward: 1   # Number of training updates per environment step
+  training_updates_per_forward: 1   # Number of training updates per environment step (kept for now)
   number_of_pretraining_updates: 1000 # Pretraining updates (unused in current setup)
   exploration_termination_step: 50000 # Step to switch from exploration to exploitation
   discount_factor: 0.997            # Discount factor for rewards (close to 1 for long horizons)
@@ -105,11 +105,11 @@ default:
 
   # Data augmentation
   augmentation_enabled: true        # Enable image augmentation (improves robustness)
-  augmentation_crop_size: 64        # Crop size for augmentation (matches typical input size)
+  augmentation_crop_size: 64        # Crop size for augmentation (matches input size)
 
   # Miscellaneous
   use_state_mean_for_evaluation: true # Use mean state for evaluation (stabilizes inference)
   reward_EMA: false                 # Use exponential moving average for rewards (disabled for simplicity)
-  number_of_possible_actions: 2     # Number of actions (e.g., for CartPole, adjust per task)
+  number_of_possible_actions: 2     # Number of actions (for CartPole)
   os_name: "posix"                  # Operating system identifier (adjust for your system)
   max_samples_per_epoch: 10000      # Maximum samples per epoch for dataset

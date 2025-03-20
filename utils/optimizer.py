@@ -33,7 +33,7 @@ class Optimizer:
         self.parameters = parameters
         self.clip = clip
         self.weight_decay = weight_decay if weight_decay is not None else 0.0
-        self.use_amp = use_amp
+        self.use_amp = use_amp and torch.cuda.is_available()  # Disable AMP on CPU
         self.debug = debug
 
         # Initialize optimizer
@@ -61,15 +61,15 @@ class Optimizer:
         else:
             raise ValueError(f"Unknown optimizer type: {opt}")
 
-        # Initialize GradScaler for mixed precision
-        self.scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-
+        # Initialize GradScaler for mixed precision (disabled on CPU)
+        self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
+        
         # Initialize scheduler if total_steps is provided
         self.scheduler = CosineAnnealingLR(self.optimizer, T_max=total_steps) if total_steps else None
         
         if self.debug:
             print(f"[DEBUG Optimizer] Initialized {self.name} with type {opt}, lr={learning_rate}, "
-                  f"clip={clip}, use_amp={use_amp}", flush=True)
+                  f"clip={self.clip}, weight_decay={self.weight_decay}, use_amp={self.use_amp}", flush=True)
 
     def __call__(self, loss: torch.Tensor, parameters_to_clip: Any, retain_graph: bool = False) -> Dict[str, float]:
         """
@@ -88,11 +88,12 @@ class Optimizer:
         if self.debug:
             print(f"[DEBUG Optimizer] {self.name} loss before backward: {metrics[f'{self.name}_loss']:.4f}", flush=True)
 
-        # Backward pass with AMP
-        self.scaler.scale(loss).backward(retain_graph=retain_graph)
-
-        # Unscale gradients before clipping
-        self.scaler.unscale_(self.optimizer)
+        # Backward pass with AMP (simplified for CPU)
+        if self.use_amp:
+            self.scaler.scale(loss).backward(retain_graph=retain_graph)
+            self.scaler.unscale_(self.optimizer)
+        else:
+            loss.backward(retain_graph=retain_graph)
 
         # Clip gradients if specified
         grad_norm = 0.0
@@ -100,11 +101,14 @@ class Optimizer:
             grad_norm = torch_utils.clip_grad_norm_(parameters_to_clip, max_norm=self.clip)
             metrics[f"{self.name}_grad_norm"] = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
             if self.debug:
-                print(f"[DEBUG Optimizer] {self.name} gradient norm: {metrics[f'{self.name}_grad_norm']:.4f}", flush=True)
+                print(f"[DEBUG Optimizer] {self.name} gradient norm after clipping: {metrics[f'{self.name}_grad_norm']:.4f}", flush=True)
 
         # Optimizer step
-        self.scaler.step(self.optimizer)
-        self.scaler.update()
+        if self.use_amp:
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            self.optimizer.step()
 
         # Scheduler step
         if self.scheduler is not None:

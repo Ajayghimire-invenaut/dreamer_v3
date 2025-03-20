@@ -1,8 +1,8 @@
 torch==2.0.0
 gym==0.26.0
-ruamel.yaml==0.17.21
+ruamel.yaml
 tensorboard==2.10.0
 numpy==1.23.5
-matplotlib==4.0.0
+matplotlib
 opencv-python==5.0.0
 pygame==2.0.2

@@ -4,6 +4,7 @@ import io
 import numpy as np
 import pathlib
 import torch
+import itertools  # Added for infinite cycling
 from typing import Any, Dict, Generator, Tuple
 from torch.utils.data import IterableDataset, DataLoader
 
@@ -65,8 +66,8 @@ class EpisodeDataset(IterableDataset):
 
 def create_dataset(episodes: Dict[str, Any], configuration: Any) -> Generator[Dict[str, Any], None, None]:
     """
-    Creates a dataset generator for training.
-    Wraps EpisodeDataset in a DataLoader and returns an iterator with batch-first data [B, T, ...].
+    Creates an infinite dataset generator for training.
+    Wraps EpisodeDataset in a DataLoader and cycles it indefinitely with batch-first data [B, T, ...].
     """
     dataset = EpisodeDataset(
         episodes,
@@ -83,7 +84,7 @@ def create_dataset(episodes: Dict[str, Any], configuration: Any) -> Generator[Di
     )
     if dataset.debug:
         print(f"[DEBUG create_dataset] Batch size: {configuration.batch_size}, Sequence length: {configuration.sequence_length}", flush=True)
-    return iter(dataloader)
+    return itertools.cycle(dataloader)  # Changed to cycle indefinitely
 
 def from_generator(generator: Generator[Dict[str, Any], None, None], batch_size: int) -> Generator[Dict[str, Any], None, None]:
     """

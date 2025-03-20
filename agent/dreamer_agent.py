@@ -32,10 +32,13 @@ class DreamerAgent(nn.Module):
         self.world_model = WorldModel(observation_space, action_space, self.current_step, configuration)
         self.task_behavior = ImaginedBehavior(configuration, self.world_model)
 
-        # Optionally compile models for speed
+        # Optionally compile models for speed (disabled on CPU)
         if configuration.compile_models and torch.cuda.is_available() and (configuration.os_name != "nt"):
             self.world_model = torch.compile(self.world_model)
             self.task_behavior = torch.compile(self.task_behavior)
+        else:
+            if self.debug:
+                print("[DEBUG DreamerAgent] Model compilation skipped: CPU or unsupported OS", flush=True)
 
         device = configuration.computation_device if torch.cuda.is_available() else "cpu"
         self.to(device)
@@ -50,6 +53,11 @@ class DreamerAgent(nn.Module):
             }
             self.explorer = behavior_options[configuration.actor.get("exploration_behavior", "greedy")]()
         self.explorer = self.explorer.to(device)
+
+        if self.debug:
+            print(f"[DEBUG DreamerAgent] Initialized on {device}, "
+                  f"training_updates: {self.training_updates}, "
+                  f"exploration_schedule: {self.exploration_schedule}", flush=True)
 
     def forward(self,
                 observation: Dict[str, Any],
@@ -102,8 +110,8 @@ class DreamerAgent(nn.Module):
             embedding,
             is_first
         )
-        # Optionally use the mean of the stochastic state for evaluation
-        if self.configuration.use_state_mean_for_evaluation and "mean" in latent_state:
+        # Use mean state for evaluation if configured
+        if self.configuration.use_state_mean_for_evaluation and "mean" in latent_state and not training:
             latent_state["stochastic"] = latent_state["mean"]
 
         # Extract features from the updated state
@@ -121,8 +129,12 @@ class DreamerAgent(nn.Module):
         else:
             if self.current_step < self.exploration_schedule:
                 actor_dist = self.explorer.actor(features)  # [B, num_actions]
+                if self.debug:
+                    print("[DEBUG _compute_policy] Using explorer policy", flush=True)
             else:
                 actor_dist = self.task_behavior.actor(features)  # [B, num_actions]
+                if self.debug:
+                    print("[DEBUG _compute_policy] Using task behavior policy", flush=True)
             action_indices = actor_dist.sample()  # [B] or [B, action_dim]
             if action_indices.dim() == 1:  # Discrete action indices
                 action_output = torch.nn.functional.one_hot(
@@ -158,11 +170,13 @@ class DreamerAgent(nn.Module):
         behavior_metrics = self.task_behavior.train_step(posterior, None)[-1]
         metrics.update(behavior_metrics)
         # Optionally train the explorer if using a non-greedy exploration strategy
-        if self.configuration.actor.get("exploration_behavior", "greedy") != "greedy":
+        if self.configuration.actor.get("exploration_behavior", "greedy") != "greedy" and self.current_step < self.exploration_schedule:
             exploration_metrics = self.explorer.train(posterior, context, batch_data)[-1]
             metrics.update({f"exploration_{name}": value for name, value in exploration_metrics.items()})
         for name, value in metrics.items():
             self.metrics.setdefault(name, []).append(value)
+        if self.debug:
+            print(f"[DEBUG _train] Metrics: {metrics}", flush=True)
 
     def train_step(self, batch_data: Dict[str, Any]) -> None:
         """Explicit training step for external calls"""

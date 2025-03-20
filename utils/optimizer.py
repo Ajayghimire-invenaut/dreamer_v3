@@ -2,6 +2,7 @@ import torch
 import torch.nn.utils as torch_utils
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from typing import Any, Dict, Optional
+import sys  # Added for Colab debug output
 
 class Optimizer:
     def __init__(self,
@@ -61,7 +62,7 @@ class Optimizer:
         else:
             raise ValueError(f"Unknown optimizer type: {opt}")
 
-        # Initialize GradScaler for mixed precision (disabled on CPU)
+        # Initialize GradScaler for mixed precision
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
         
         # Initialize scheduler if total_steps is provided
@@ -69,7 +70,8 @@ class Optimizer:
         
         if self.debug:
             print(f"[DEBUG Optimizer] Initialized {self.name} with type {opt}, lr={learning_rate}, "
-                  f"clip={self.clip}, weight_decay={self.weight_decay}, use_amp={self.use_amp}", flush=True)
+                  f"clip={self.clip}, weight_decay={self.weight_decay}, use_amp={self.use_amp}", 
+                  flush=True, file=sys.stderr)
 
     def __call__(self, loss: torch.Tensor, parameters_to_clip: Any, retain_graph: bool = False) -> Dict[str, float]:
         """
@@ -81,17 +83,28 @@ class Optimizer:
         :return: Dictionary of metrics (loss and gradient norm).
         """
         metrics: Dict[str, float] = {f"{self.name}_loss": loss.detach().cpu().item()}
-
-        # Zero gradients
         self.optimizer.zero_grad(set_to_none=True)  # More memory-efficient
         
         if self.debug:
-            print(f"[DEBUG Optimizer] {self.name} loss before backward: {metrics[f'{self.name}_loss']:.4f}", flush=True)
+            print(f"[DEBUG Optimizer] {self.name} loss before backward: {metrics[f'{self.name}_loss']:.4f}", 
+                  flush=True, file=sys.stderr)
 
-        # Backward pass with AMP (simplified for CPU)
+        # Compute raw gradient norm before scaling/clipping
+        if self.debug:
+            loss.backward(retain_graph=True)
+            raw_grad_norm = torch_utils.clip_grad_norm_(parameters_to_clip, max_norm=float('inf'))  # No clipping, just measure
+            print(f"[DEBUG Optimizer] {self.name} raw gradient norm before scaling: {raw_grad_norm.item():.4f}", 
+                  flush=True, file=sys.stderr)
+            self.optimizer.zero_grad(set_to_none=True)  # Reset for actual backward
+
+        # Backward pass with AMP
         if self.use_amp:
             self.scaler.scale(loss).backward(retain_graph=retain_graph)
             self.scaler.unscale_(self.optimizer)
+            if self.debug:
+                scaled_grad_norm = torch_utils.clip_grad_norm_(parameters_to_clip, max_norm=float('inf'))  # Measure unscaled
+                print(f"[DEBUG Optimizer] {self.name} gradient norm after unscaling: {scaled_grad_norm.item():.4f}", 
+                      flush=True, file=sys.stderr)
         else:
             loss.backward(retain_graph=retain_graph)
 
@@ -101,7 +114,8 @@ class Optimizer:
             grad_norm = torch_utils.clip_grad_norm_(parameters_to_clip, max_norm=self.clip)
             metrics[f"{self.name}_grad_norm"] = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
             if self.debug:
-                print(f"[DEBUG Optimizer] {self.name} gradient norm after clipping: {metrics[f'{self.name}_grad_norm']:.4f}", flush=True)
+                print(f"[DEBUG Optimizer] {self.name} gradient norm after clipping (max {self.clip}): {metrics[f'{self.name}_grad_norm']:.4f}", 
+                      flush=True, file=sys.stderr)
 
         # Optimizer step
         if self.use_amp:
@@ -115,7 +129,8 @@ class Optimizer:
             self.scheduler.step()
             metrics[f"{self.name}_learning_rate"] = self.optimizer.param_groups[0]["lr"]
             if self.debug:
-                print(f"[DEBUG Optimizer] {self.name} updated learning rate: {metrics[f'{self.name}_learning_rate']:.6f}", flush=True)
+                print(f"[DEBUG Optimizer] {self.name} updated learning rate: {metrics[f'{self.name}_learning_rate']:.6f}", 
+                      flush=True, file=sys.stderr)
 
         return metrics
 
@@ -132,7 +147,7 @@ class Optimizer:
         if self.scheduler is not None:
             state["scheduler"] = self.scheduler.state_dict()
         if self.debug:
-            print(f"[DEBUG Optimizer] {self.name} state_dict keys: {list(state.keys())}", flush=True)
+            print(f"[DEBUG Optimizer] {self.name} state_dict keys: {list(state.keys())}", flush=True, file=sys.stderr)
         return state
 
     def load_state_dict(self, state_dict: Dict) -> None:
@@ -146,7 +161,7 @@ class Optimizer:
         if self.scheduler is not None and "scheduler" in state_dict:
             self.scheduler.load_state_dict(state_dict["scheduler"])
         if self.debug:
-            print(f"[DEBUG Optimizer] {self.name} loaded state_dict with keys: {list(state_dict.keys())}", flush=True)
+            print(f"[DEBUG Optimizer] {self.name} loaded state_dict with keys: {list(state_dict.keys())}", flush=True, file=sys.stderr)
 
     def get_lr(self) -> float:
         """
@@ -156,5 +171,5 @@ class Optimizer:
         """
         lr = self.optimizer.param_groups[0]["lr"]
         if self.debug:
-            print(f"[DEBUG Optimizer] {self.name} current learning rate: {lr:.6f}", flush=True)
+            print(f"[DEBUG Optimizer] {self.name} current learning rate: {lr:.6f}", flush=True, file=sys.stderr)
         return lr

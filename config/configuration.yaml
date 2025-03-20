@@ -1,7 +1,7 @@
 default:
   # General settings
   precision: 16                     # Use mixed precision (AMP) for GPU efficiency
-  computation_device: "cuda"        # Changed to "cuda" for GPU
+  computation_device: "cpu"        # Changed to "cuda" for GPU
   random_seed: 42                   # Seed for reproducibility
   action_repeat: 2                  # Number of times actions are repeated
   total_training_steps: 1000000     # Total training steps

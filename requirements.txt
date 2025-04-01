@@ -1,8 +1,8 @@
-torch==2.0.0
-gym==0.26.0
+torch>=2.3.0
+gymnasium>=0.29.1
 ruamel.yaml
 tensorboard==2.10.0
 numpy==1.23.5
-matplotlib
-opencv-python==5.0.0
+matplotlib>=3.8.0
+opencv-python>=4.10.0
 pygame==2.0.2

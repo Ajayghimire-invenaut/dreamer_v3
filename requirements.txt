@@ -1,9 +1,11 @@
-# Core PyTorch dependencies (CPU-only)
-torch==2.0.1+cpu
-torchvision==0.15.2+cpu
+# Core PyTorch dependencies (GPU - CUDA 11.8)
+torch==2.0.1+cu118
+torchvision==0.15.2+cu118
+# Use the PyTorch extra index to resolve the CUDA wheels
+--extra-index-url https://download.pytorch.org/whl/cu118
 
 # Environment and RL dependencies
-tensorboard==2.17.1  # Already included, provides SummaryWriter
+tensorboard==2.17.1
 gym==0.26.2
 mujoco==2.3.5
 dm_control==1.0.9

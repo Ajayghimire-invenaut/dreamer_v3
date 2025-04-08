@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import os  # Added for checkpoint path handling
 from core.world_domain.dynamics import WorldDynamics
 from core.world_domain.encoder import ObservationEncoder
 from core.world_domain.decoder import ObservationDecoder
@@ -60,6 +61,43 @@ class DreamerTrainer:
             batch_size=config["batch_size"],
             device=self.device
         )
+        self.checkpoint_path = os.path.join(config["log_dir"], "checkpoint.pt")  # Default checkpoint path
+
+    def save_checkpoint(self, step):
+        """Save model state and optimizer state."""
+        checkpoint = {
+            "step": step,
+            "encoder_state": self.encoder.state_dict(),
+            "decoder_state": self.decoder.state_dict(),
+            "dynamics_state": self.dynamics.state_dict(),
+            "reward_predictor_state": self.reward_predictor.state_dict(),
+            "actor_state": self.actor.state_dict(),
+            "critic_state": self.critic.state_dict(),
+            "world_optimizer_state": self.world_optimizer.state_dict(),
+            "actor_optimizer_state": self.actor_optimizer.state_dict(),
+            "critic_optimizer_state": self.critic_optimizer.state_dict(),
+        }
+        torch.save(checkpoint, self.checkpoint_path)
+        print(f"Checkpoint saved at step {step}")
+
+    def load_checkpoint(self, checkpoint_path=None):
+        """Load model state and optimizer state."""
+        if checkpoint_path is None:
+            checkpoint_path = self.checkpoint_path
+        if os.path.exists(checkpoint_path):
+            checkpoint = torch.load(checkpoint_path, map_location=self.device)
+            self.encoder.load_state_dict(checkpoint["encoder_state"])
+            self.decoder.load_state_dict(checkpoint["decoder_state"])
+            self.dynamics.load_state_dict(checkpoint["dynamics_state"])
+            self.reward_predictor.load_state_dict(checkpoint["reward_predictor_state"])
+            self.actor.load_state_dict(checkpoint["actor_state"])
+            self.critic.load_state_dict(checkpoint["critic_state"])
+            self.world_optimizer.load_state_dict(checkpoint["world_optimizer_state"])
+            self.actor_optimizer.load_state_dict(checkpoint["actor_optimizer_state"])
+            self.critic_optimizer.load_state_dict(checkpoint["critic_optimizer_state"])
+            print(f"Loaded checkpoint from step {checkpoint['step']}")
+            return checkpoint["step"]
+        return 0
 
     def collect_data(self, num_steps=100):
         obs = self.env.reset().to(self.device)
@@ -79,10 +117,14 @@ class DreamerTrainer:
             total_reward += reward.item()
             episode_length += 1
             
+            print(f"Step {episode_length}: Reward={reward.item()}, Done={done}")
+            
             obs = next_obs
-            if done or episode_length % 100 == 0:  # Log every 200 steps or on done
+            if done or episode_length % 100 == 0 or episode_length >= max_episode_length:
+                print(f"Logging episode: Total Reward={total_reward}, Length={episode_length}")
                 self.logger.log_episode(total_reward, episode_length)
-                if done:
+                if done or episode_length >= max_episode_length:
+                    print("Episode completed!")
                     obs = self.env.reset().to(self.device)
                     total_reward = 0.0
                     episode_length = 0
@@ -127,7 +169,6 @@ class DreamerTrainer:
         # Imagination-based behavior training (fully detached)
         with torch.no_grad():
             stoch, deter = self.dynamics.initial_state(self.config["batch_size"], self.device)
-            # Warm-up states without gradients
             for t in range(self.config["batch_length"]):
                 action_t = actions[:, t]
                 stoch, deter, _, _ = self.dynamics(stoch, deter, action_t)
@@ -192,11 +233,14 @@ class DreamerTrainer:
         self.logger.log_metrics(metrics)
 
     def train(self):
-        for step in range(self.config["max_steps"]):
+        start_step = self.load_checkpoint()  # Load checkpoint if exists
+        for step in range(start_step, self.config["max_steps"]):
             self.collect_data(num_steps=self.config["collect_steps"])
             self.train_step()
             if step % 100 == 0:
                 print(f"Step {step}: Training in progress...")
+            if step % 10000 == 0 and step > 0:  # Save checkpoint every 10,000 steps
+                self.save_checkpoint(step)
         
         self.env.close()
         self.logger.close()

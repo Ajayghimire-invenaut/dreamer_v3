@@ -1,4 +1,7 @@
 # Entry point for running the DreamerV3 system
+import os
+os.environ["MUJOCO_GL"] = "egl"
+
 import argparse
 import torch
 from application.trainer import DreamerTrainer
@@ -22,10 +25,12 @@ def parse_arguments():
                         help="Maximum training steps (default 1M; official is ~100M)")
     parser.add_argument("--cuda", action="store_true",
                         help="Use CUDA if available")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Path to checkpoint file to resume training (optional)")
     return parser.parse_args()
 
 def main():
-    """Initialize and run the DreamerV3 training process."""
+    """Initialize and run the DreamerV3 training process with checkpointing."""
     # Parse command-line arguments
     args = parse_arguments()
     
@@ -53,8 +58,14 @@ def main():
     for key, value in config.items():
         print(f"  {key}: {value}")
     
-    # Initialize and run trainer
+    # Initialize trainer
     trainer = DreamerTrainer(config, device)
+    
+    # Load checkpoint if specified
+    if args.checkpoint:
+        trainer.load_checkpoint(args.checkpoint)
+    
+    # Run training
     trainer.train()
 
 if __name__ == "__main__":

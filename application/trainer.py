@@ -19,6 +19,7 @@ class DreamerTrainer:
         self.config = config
         self.device = device
         self.tools = DataTools()
+        self.step = 0  # Track training step
 
         self.env = EnvironmentManager(
             task_name=config["task_name"],
@@ -122,7 +123,7 @@ class DreamerTrainer:
             obs = next_obs
             if done or episode_length % 100 == 0 or episode_length >= max_episode_length:
                 print(f"Logging episode: Total Reward={total_reward}, Length={episode_length}")
-                self.logger.log_episode(total_reward, episode_length)
+                self.logger.log_episode(total_reward, episode_length, step=self.step)
                 if done or episode_length >= max_episode_length:
                     print("Episode completed!")
                     obs = self.env.reset().to(self.device)
@@ -230,17 +231,19 @@ class DreamerTrainer:
             "actor/loss": actor_loss.item(),
             "critic/loss": critic_loss.item()
         }
-        self.logger.log_metrics(metrics)
+        self.logger.log_metrics(metrics, step=self.step)
 
     def train(self):
         start_step = self.load_checkpoint()  # Load checkpoint if exists
+        self.step = start_step
         for step in range(start_step, self.config["max_steps"]):
             self.collect_data(num_steps=self.config["collect_steps"])
             self.train_step()
-            if step % 100 == 0:
-                print(f"Step {step}: Training in progress...")
-            if step % 10000 == 0 and step > 0:  # Save checkpoint every 10,000 steps
-                self.save_checkpoint(step)
+            self.step += 1
+            if self.step % 100 == 0:
+                print(f"Step {self.step}: Training in progress...")
+            if self.step % 1000 == 0 and self.step > 0:  # Save checkpoint every 1,000 steps
+                self.save_checkpoint(self.step)
         
         self.env.close()
         self.logger.close()

@@ -1,8 +1,18 @@
-torch>=2.3.0
-gymnasium>=0.29.1
-ruamel.yaml
-tensorboard==2.10.0
-numpy==1.23.5
-matplotlib>=3.8.0
-opencv-python>=4.10.0
-pygame==2.0.2
+# Core PyTorch dependencies (CPU-only)
+torch==2.0.1+cpu
+torchvision==0.15.2+cpu
+
+# Environment and RL dependencies
+tensorboard==2.17.1  # Already included, provides SummaryWriter
+gym==0.26.2
+mujoco==2.3.5
+dm_control==1.0.9
+moviepy==1.0.3
+
+# Atari-specific dependencies (optional)
+atari-py==0.2.9
+opencv-python==4.10.0.84
+
+# Additional utilities
+numpy==1.26.4
+pyopengl==3.1.7
